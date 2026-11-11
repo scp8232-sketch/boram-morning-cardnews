@@ -1,0 +1,72 @@
+name: 이보람의 평일 아침 카드뉴스
+
+on:
+  schedule:
+    # 한국시간 월~금 05:34. GitHub cron은 UTC 기준이며 실행 지연 가능.
+    - cron: '34 20 * * 0-4'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: morning-cardnews
+  cancel-in-progress: false
+
+jobs:
+  build-and-send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 한글 폰트 설치
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y fonts-nanum
+      - name: 파이썬 패키지 설치
+        run: pip install -r requirements.txt
+      - name: 최신 뉴스 수집 및 카드 2장 생성
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python -m src.automation
+      - name: 공개 이미지 저장 (민감정보 제외)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/
+          if ! git diff --cached --quiet; then
+            git commit -m "cards: $(TZ=Asia/Seoul date +%F)"
+            git push
+          fi
+      - name: GitHub Pages 설정
+        uses: actions/configure-pages@v5
+      - name: 카드뉴스 웹페이지 업로드
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+      - name: 공개 페이지 배포
+        id: deploy
+        uses: actions/deploy-pages@v4
+      - name: 카카오톡 나에게 카드 두 장 발송
+        env:
+          KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
+          KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          PAGES_BASE_URL: ${{ steps.deploy.outputs.page_url }}
+        run: python -m src.send_kakao
+      - name: 갱신된 리프레시 토큰 암호화 파일 보관
+        if: always()
+        run: |
+          git add data/kakao_refresh.enc data/sent.json 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "security: save encrypted Kakao refresh state"
+            git push
+          fi
