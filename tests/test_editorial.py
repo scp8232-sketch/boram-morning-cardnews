@@ -1,5 +1,6 @@
 """실제 고객에게 보낼 수 없는 추상/반복/미검증 문장을 자동 발행하지 않는지 검증."""
 from datetime import date
+import json
 import pytest
 from src import editorial
 
@@ -495,3 +496,66 @@ def test_verified_ai_content_is_not_overwritten_by_fallback(monkeypatch):
     with pytest.raises(editorial.PublicationQualityError, match='검증 미통과') as exc:
         editorial.write_verified_news(categories)
     assert '경제' not in str(exc.value)
+
+
+def _politics_like_long_source():
+    # Invented fixture only: test input, never customer-facing news.
+    sentences=[
+        '청와대는 15일 국민의 일상을 위협하는 범죄에 대응하기 위해 국민안전 플러스 프로젝트를 가동한다고 발표했습니다.',
+        '청와대는 관계 부처의 대응 상황과 추진 성과를 점검하고 국민이 체감할 수 있는 구체적인 조치를 추진하겠다고 밝혔습니다.',
+        '정부는 관계 기관에 정책 추진 현황을 보고하도록 요청하고 연말까지 현장 안내 체계를 함께 정비할 방침이라고 설명했습니다.',
+        '이번 발표는 관계기관 협의가 남아 있어서 시행 일정이 아직 확정된 상태는 아니라고 담당자가 안내했습니다.',
+        '현장에서는 대책의 내용과 관리 방법을 차례로 점검하며 각 부서의 운영 현황을 정리하기로 했다고 설명했습니다.',
+        '각 기관은 관련 사업 추진 과정에서 발생하는 문제들을 정기적으로 파악하고 이후 결과를 공개한다고 밝혔습니다.',
+    ]
+    return {'category':'정치','candidate_id':'fake-politics-test',
+            'title':'청와대, 국민안전 플러스 프로젝트 가동 및 부처별 점검 추진',
+            'content':' '.join(sentences),'url':'https://example.org/fictitious-politics-news',
+            'source':'실험 기사','date':'2026-11-15'}
+
+
+def test_narrow_two_fact_repair_rewrites_long_complete_source_sentences(monkeypatch):
+    source=_politics_like_long_source()
+    assert len(editorial.evidence_catalog(source['content']))>=3
+    pair=editorial._best_full_fact_pair(source)
+    assert pair and pair[0]!=pair[2]
+    # Realistic two-sentence summary of the preselected grounded facts.
+    body=('청와대는 15일 국민안전 플러스 프로젝트를 가동한다고 발표했습니다. '
+          '관계 부처의 대응 상황과 추진 성과를 점검하고 구체적인 조치를 추진하겠다고 밝혔습니다.')
+    assert 70 <= len(body) <= 125, len(body)
+    class Reply:
+        def raise_for_status(self):pass
+        def json(self):return {'candidates':[{'content':{'parts':[{'text':json.dumps(
+            {'headline':'청와대, 국민안전 프로젝트 가동과 관계부처 성과 점검',
+             'summary':body},ensure_ascii=False)}]}}]}
+    captures=[]
+    def mock_post(url,**kw):
+        captures.append(kw)
+        return Reply()
+    monkeypatch.setattr(editorial.requests,'post',mock_post)
+    approved=editorial._narrow_ai_repair('fake-key',source)
+    assert approved is not None, 'Last-resort narrow fact rewrite must be accepted'
+    assert editorial.validate_article(approved,source)[0]
+    assert len(captures)==1
+    assert '근거1' in captures[0]['json']['contents'][0]['parts'][0]['text']
+    assert 'fake-key' not in captures[0]['json']['contents'][0]['parts'][0]['text']
+
+
+def test_narrow_two_fact_repair_drops_fabricated_number(monkeypatch):
+    source=_politics_like_long_source()
+    body=('청와대는 15일 국민안전 플러스 프로젝트를 가동한다고 발표했습니다. '
+          '관계 부처 9999곳의 대응 상황과 추진 성과를 점검하고 구체적인 조치를 추진하겠다고 밝혔습니다.')
+    class Reply:
+        def raise_for_status(self):pass
+        def json(self):return {'candidates':[{'content':{'parts':[{'text':json.dumps(
+            {'headline':'청와대, 국민안전 프로젝트 가동과 관계부처 성과 점검',
+             'summary':body},ensure_ascii=False)}]}}]}
+    monkeypatch.setattr(editorial.requests,'post',lambda *a,**kw:Reply())
+    assert editorial._narrow_ai_repair('fake-key',source) is None
+
+
+def test_narrow_two_fact_repair_requires_two_real_facts(monkeypatch):
+    source=_politics_like_long_source()
+    source['content']='정부가 관계 정책을 발표했다고 밝혔다. '*25
+    monkeypatch.setattr(editorial.requests,'post',lambda *a,**kw:pytest.fail('No AI call permitted'))
+    assert editorial._narrow_ai_repair('fake-key',source) is None

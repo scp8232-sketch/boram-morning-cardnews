@@ -517,60 +517,62 @@ summary는 공백과 문장부호를 포함해 **반드시 70~125자**로 작성
 
 
 def _fallback_sentence_candidates(article: dict) -> list[tuple[float, str, str]]:
-    """Find complete, concrete statements that occur verbatim in a fetched article.
+    """Select source-verbatim, self-contained statements with grounded actions.
 
-    This is an emergency *source-extractive* path, not a way to manufacture news.
-    Discard fragments produced by evidence_catalog's long-paragraph splitting.
+    Previous versions excluded most genuine reporting by demanding 27–95
+    characters, a tiny fixed list of verbs and title-keyword overlap.  Real
+    Korean wire-service sentences often exceed 95 characters or use passive
+    verbs.  We still reject incomplete fragments, advertorial boilerplate,
+    ungrounded statements, and sentences without factual content.
     """
     body = compact(article.get('content', ''))
     title = compact(article.get('title', ''))
-    if not valid_link(article.get('url','')) or len(normalize(body)) < 260 or not (18 <= len(title) <= 56):
+    if not valid_link(article.get('url','')) or len(normalize(body)) < 260:
         return []
     if any(x.lower() in title.lower() for x in BAD_TITLES + BANNED_FILLER):
         return []
     catalog = evidence_catalog(body)
     title_terms = {normalize(x) for x in re.findall(r'[가-힣A-Za-z]{2,}', title)
-                   if len(normalize(x)) >= 2 and x not in ('관련', '대한', '추진', '오늘', '내일', '한국', '정부', '발표')}
-    boilerplate = ('무단전재', '재배포', '제보', '기사제공', '구독', 'ⓒ',
-                   '사진=', '기자=', 'Copyright', 'All Rights Reserved',
-                   '기자]', '이미지 크게 보기', '개인정보', '저작권', '관련기사')
-    action_terms = ('발표', '개최', '진행', '확정', '의결', '통과', '신청', '접수',
-                    '운영', '시행', '확대', '감소', '증가', '지원', '설치', '제공',
-                    '열었', '논의', '설명', '다뤘', '찾았', '열린', '출범', '착공',
-                    '밝혔', '공개', '출시', '착수', '조사', '발급', '선정', '전달',
-                    '완료', '준비', '개정', '예정', '참여', '도입', '집계', '제출')
+                   if len(normalize(x)) >= 2 and x not in (
+                       '관련','대한','추진','오늘','내일','한국','정부','발표','이날')}
+    boilerplate = ('무단전재','재배포','제보','기사제공','구독','ⓒ',
+                   '사진=','기자=','Copyright','All Rights Reserved',
+                   '기자]','이미지 크게 보기','개인정보','저작권','관련기사')
+    # Frequent real Korean news verbs; a rigid specific list is not a quality
+    # test. Combine factual predicates with article title/actor/date anchors.
+    report_verbs = ('밝혔','밝혔다','발표','설명','확인','공개','의결','통과','시행',
+                    '진행','운영','제공','선정','검토','예정','추진','지원','확대',
+                    '개최','조사','대응','참여','개정','마련','도입','접수','시작',
+                    '증가','감소','열렸','개설','조성','진행됐','발급','출범',
+                    '실시','결정','변경','개발','논의','기록','발견','집계',
+                    '진출','공연','전시','공연했','열린','진행된','연구')
     chosen = []
     seen = set()
     for index, (eid, passage) in enumerate(catalog.items()):
         sentence = compact(passage)
         identifier = normalize(sentence)
-        if identifier in seen or not (27 <= len(sentence) <= 95):
+        if identifier in seen or not (24 <= len(sentence) <= 125):
             continue
-        if not sentence.endswith(('.', '!', '?', '。')):
-            continue
-        if not re.search(r'[가-힣]', sentence):
+        if not sentence.endswith(('.', '!', '?', '。')) or not re.search(r'[가-힣]', sentence):
             continue
         if any(b.lower() in sentence.lower() for b in boilerplate + BANNED_FILLER):
             continue
-        # Exclude weak detached fragments and boilerplate. Require an actual
-        # action and a topic anchor, not just a sentence-shaped generality.
-        if not any(term in sentence for term in action_terms):
+        # Require a complete news-style assertion; title only or an orphaned
+        # noun phrase cannot serve as evidence.
+        if not (any(term in sentence for term in report_verbs) or
+                re.search(r'(?:했다|된다|됐다|있다|없다|나섰다|열었다|늘었다|줄었다|이다|었다|으로 보인다|다고 전했다)[.!?。]$', sentence)):
             continue
-        overlap = sum(1 for t in title_terms if t in normalize(sentence))
-        specific = bool(re.search(r'\d{1,4}(?:[.,]\d+)?(?:년|월|일|명|곳|개|원|%|건|차례)|'
-                                  r'\d{1,4}년|\d{1,2}월|\d+%', sentence))
-        institution = any(w in sentence for w in (
-            '금융위원회','행정안전부','질병관리청','복지부','보험공단','시청',
-            '국회','정부','법원','경찰','한국은행','교육부','대통령','한국거래소',
-            '서울시','보건복지부','기상청','지방자치단체','공단','위원회'))
-        if not (specific or institution or overlap >= 2):
+        overlap = sum(1 for t in title_terms if t in identifier)
+        has_number = bool(re.search(r'\d+(?:[,.]\d+)*(?:년|월|일|명|곳|개|원|%|건|차례|억|조)', sentence))
+        has_actor = bool(re.search(r'(?:(?:청|부|처|원|공사|공단|위원회|협회|재단|지자체|시|군|구|법원|국회|경찰|기업|대학|병원)은|는|에서)', sentence))
+        if not (overlap >= 1 or has_actor or has_number):
             continue
-        score = min(8, overlap * 2) + (3 if specific else 0) + (2 if institution else 0) - index * .15
+        score = (min(8, overlap * 2) + (3 if has_number else 0) +
+                 (2 if has_actor else 0) + (1 if 35 <= len(sentence) <= 83 else 0)
+                 - index * .08)
         chosen.append((score, eid, sentence))
         seen.add(identifier)
     return chosen
-
-
 
 
 def _formalize_source_sentence(sentence: str) -> str:
@@ -605,6 +607,110 @@ def _formalize_source_sentence(sentence: str) -> str:
         if sentence.endswith(old):
             return sentence[:-len(old)] + new
     return sentence
+
+
+
+
+def _best_full_fact_pair(article: dict) -> tuple[str, str, str, str] | None:
+    """Choose two independently grounded COMPLETE source facts for a narrow repair.
+
+    Unlike the extractive path, the selected complete sentences may be long:
+    the model is asked to paraphrase only these two, then all final facts are
+    checked against the same real article.  Never promote source fragments.
+    """
+    body = compact(article.get('content', ''))
+    if len(normalize(body)) < 260 or not valid_link(article.get('url', '')):
+        return None
+    catalog = evidence_catalog(body)
+    if len(catalog) < 2:
+        return None
+    title_terms = {normalize(x) for x in re.findall(r'[가-힣A-Za-z]{2,}',article.get('title',''))
+                   if len(normalize(x)) >= 3}
+    facts = []
+    junk = ('무단전재','재배포','Copyright','무단 복제','기자 구독','제보','다른기사',
+            '기사제공','저작권','이용약관') + BANNED_FILLER
+    for i,(eid,text) in enumerate(catalog.items()):
+        t=compact(text)
+        if not (27 <= len(t) <= 210) or not t.endswith(('.', '!', '?', '。')):
+            continue
+        if any(b.lower() in t.lower() for b in junk):
+            continue
+        norm=normalize(t)
+        overlap=sum(1 for x in title_terms if x in norm)
+        grounded=bool(re.search(r'\d+(?:[,.]\d+)*(?:년|월|일|명|명|곳|개|원|%|건)',t))
+        event=any(w in t for w in ('발표','밝혔','시행','진행','개최','예정','공개',
+                                  '마련','개정','선정','제공','참석','확대','운영',
+                                  '지원','접수','열었','논의','검토','추진',
+                                  '전시','공연','개막','폐막','기획','참여',
+                                  '지난','확인','증가','감소','열렸'))
+        if not (event or grounded or overlap >= 2):
+            continue
+        facts.append((4*overlap+3*grounded+2*event-i*.08,eid,t))
+    if len(facts) < 2:
+        return None
+    # Minimize repeated sentences: require each statement to contain some
+    # independent informational material (different 3+ syllable words).
+    pairs=[]
+    for j,(a,e1,t1) in enumerate(facts):
+        for b,e2,t2 in facts[j+1:]:
+            words1=set(re.findall(r'[가-힣A-Za-z]{3,}',t1))
+            words2=set(re.findall(r'[가-힣A-Za-z]{3,}',t2))
+            if words1 and words2 and len(words1 & words2)/min(len(words1),len(words2)) >= .86:
+                continue
+            pairs.append((a+b,e1,t1,e2,t2))
+    if not pairs: return None
+    _,e1,t1,e2,t2=max(pairs,key=lambda p:p[0])
+    return e1,t1,e2,t2
+
+
+def _narrow_ai_repair(key: str, candidate: dict) -> dict | None:
+    """Single grounded rewrite; cannot select new sources or invent evidence IDs.
+
+    This is a last resort after normal writing and full-sentence extractive
+    fallback have both failed.  It only summarizes two preselected complete
+    verbatim facts, never a self-chosen article.
+    """
+    pair = _best_full_fact_pair(candidate)
+    if not pair: return None
+    eid1,source1,eid2,source2=pair
+    raw_title=compact(candidate.get('title',''))
+    instruction=('다음 한국어 뉴스 기사에서 실제로 추출한 완결된 사실 문장 두 개만 이용해 '
+       '고객에게 보여줄 요약을 작성해 주세요. 문장에 없는 일시·숫자·기관·제도·시행 여부를 만들어서는 안 됩니다. '
+       '확정/제안/검토/시행을 구분하고 자극적인 해석이나 상투적인 말은 제외하세요. '
+       'headline은 18~56자, summary는 공백 포함 70~125자이며 실제 사실 2개를 담은 자연스러운 두 문장입니다. '
+       '제목을 그대로 본문 앞에 반복하지 마세요. 단 한 건에 대해 headline과 summary 두 문자열을 반드시 반환하세요. '
+       '요약에 나타나는 모든 숫자는 제공된 출처 제목 또는 아래 사실 문장에 나오는 숫자여야 합니다. '
+       '원문 제목: '+raw_title+'\n근거1: '+source1+'\n근거2: '+source2)
+    schema={'type':'OBJECT','properties':{'headline':{'type':'STRING'},'summary':{'type':'STRING'}},
+            'required':['headline','summary']}
+    model=os.environ.get('GEMINI_EDITOR_MODEL','gemini-3.5-flash-lite').strip()
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{2,90}', model):
+        raise PublicationQualityError('잘못된 Gemini 모델명 설정')
+    url=f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent'
+    payload={'contents':[{'parts':[{'text':instruction}]}],
+             'generationConfig':{'responseMimeType':'application/json','responseSchema':schema,
+                                 'temperature':0.1,'maxOutputTokens':1500}}
+    try:
+        response=requests.post(url,headers={'x-goog-api-key':key},json=payload,timeout=65)
+        response.raise_for_status()
+        parsed=response.json()
+        raw=parsed['candidates'][0]['content']['parts'][0]['text']
+        obj=json.loads(raw)
+    except (requests.RequestException,KeyError,IndexError,TypeError,ValueError,json.JSONDecodeError) as exc:
+        # No key or response body in logs.
+        print('[근거 2문장 좁힌 재작성] API/응답 오류: '+type(exc).__name__,flush=True)
+        return None
+    if not isinstance(obj,dict):return None
+    # Evidence IDs and candidate identity are determined by trusted code.
+    draft={'category':candidate['category'],'candidate_id':candidate['candidate_id'],
+           'headline':compact(obj.get('headline','')),'summary':compact(obj.get('summary','')),
+           'evidence_ids':[eid1,eid2]}
+    draft=_compact_long_summary(draft)
+    ok,why=validate_article(draft,candidate)
+    if not ok:
+        print('[근거 2문장 좁힌 재작성] 검증 탈락: '+why,flush=True)
+        return None
+    return draft
 
 
 def _safe_extractive_fallback(article: dict) -> dict | None:
@@ -771,6 +877,31 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
             reasons[cat] = (reasons.get(cat, '검증 가능한 AI 기사 없음')
                             + ' / 원문 기반 대체도 사실 문장 2개·길이 기준 미충족')
             print(f'[원문 기반 대체 불가] {cat}: 완전한 사실 문장 두 개 및 길이 기준 미충족', flush=True)
+
+    # The same full-length prompts often return an empty items[] even when
+    # the source contains two excellent factual statements. For remaining
+    # categories allow ONE narrow rewrite with *preselected* passage IDs.
+    # Output still passes the normal source/number/title checks.
+    for cat in intended:
+        if cat in approved: continue
+        for candidate in candidates.get(cat,[])[:2]:
+            try:
+                fixed=_narrow_ai_repair(key,candidate)
+            except PublicationQualityError:
+                raise
+            if fixed is None: continue
+            proofs,_=_verified_evidence(fixed,candidate['content'])
+            approved[cat]={
+                'category':cat, 'title':candidate['title'],
+                'headline':fixed['headline'],'summary':fixed['summary'],
+                'date':candidate['date'],'source':candidate['source'],
+                'url':candidate['url'],'fact_proofs':[{'quote':compact(e)[:180]} for e in proofs],
+                'fact_content_hash':hashlib.sha256(candidate['content'].encode()).hexdigest()[:16],
+                'selection_mode':'grounded_two_fact_rewrite',
+            }
+            reasons.pop(cat,None)
+            print(f'[근거 2문장으로 재작성 통과] {cat}',flush=True)
+            break
 
     missing=[cat for cat in intended if cat not in approved]
     if missing:
