@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, timedelta
 from email.utils import parsedate_to_datetime
 from html import unescape
@@ -35,14 +36,14 @@ FEEDS = {
  '사회': ['https://www.mois.go.kr/gpms/view/jsp/rss/rss.jsp?ctxCd=1012','https://www.newsis.com/RSS/society.xml','https://www.yna.co.kr/rss/news.xml'],
  '국제': ['https://www.newsis.com/RSS/international.xml','https://www.yna.co.kr/rss/international.xml'],
  '생활/문화': ['https://www.newsis.com/RSS/culture.xml','https://www.yna.co.kr/rss/culture.xml','https://www.khan.co.kr/rss/rssdata/culture_news.xml'],
- '건강보험': ['https://www.yna.co.kr/rss/health.xml','https://www.newsis.com/RSS/health.xml'],
- '보험제도': ['https://www.newsis.com/RSS/bank.xml','https://www.yna.co.kr/rss/economy.xml'],
+ '건강보험': ['https://www.newsis.com/RSS/society.xml','https://www.yna.co.kr/rss/news.xml','https://www.newsis.com/RSS/bank.xml','https://www.newsis.com/RSS/health.xml'],
+ '보험제도': ['https://www.newsis.com/RSS/bank.xml','https://www.newsis.com/RSS/economy.xml','https://www.yna.co.kr/rss/economy.xml','https://www.newsis.com/RSS/society.xml'],
  '보건정책': ['https://www.newsis.com/RSS/health.xml','https://www.yna.co.kr/rss/health.xml'],
  '의료기술': ['https://www.newsis.com/RSS/health.xml','https://www.yna.co.kr/rss/health.xml'],
  '건강정보': ['https://www.yna.co.kr/rss/health.xml','https://www.newsis.com/RSS/health.xml'],
 }
 CATEGORY_TERMS = {
- '건강보험':('건강보험','보험급여','급여','수가','심평원','건보','국민건강보험','의료급여'),
+ '건강보험':('건강보험','보험급여','수가','심평원','건보','국민건강보험','본인부담금','의료급여','보험료 환급'),
  '보험제도':('보험','실손','보험금','피보험자','보험약관','GA','손해보험','생명보험'),
  '보건정책':('보건','복지부','의료기관','공공의료','병원','진료','지역의료'),
  '의료기술':('신약','임상','의료기기','바이오','치료제','의약품','진단','식약처','연구'),
@@ -54,8 +55,8 @@ NEWS_QUERIES = {
  '사회':'사회 교육 안전 재난 제도 when:3d',
  '국제':'국제 정상회의 외교 무역 주요국 when:3d',
  '생활/문화':'한국 문화축제 전시 공연 일정 when:5d',
- '건강보험':'건강보험 보험급여 국민건강보험심사평가원 when:10d',
- '보험제도':'보험금 청구 실손의료보험 금융감독원 when:10d',
+ '건강보험':'건보공단 건강보험 환급금 본인부담금 보험급여 when:21d',
+ '보험제도':'금융위원회 실손보험 보험금 청구 보험제도 when:21d',
  '보건정책':'보건복지부 의료정책 의료시설 when:7d',
  '의료기술':'신약 임상 식약처 의료기기 when:10d',
  '건강정보':'질병관리청 감염병 예방 질병 when:7d',
@@ -181,12 +182,16 @@ def fetch_fulltext(url: str) -> str:
     except requests.RequestException:
         return ''
     soup=BeautifulSoup(r.text,'html.parser')
+    ld_json = [node.string or node.get_text() for node in soup.find_all('script', attrs={'type': 'application/ld+json'})]
     for tag in soup.select('script, style, nav, footer, header, aside, iframe, form, noscript, .ad, .advertisement, .copyright'):
         tag.decompose()
     # 기사 본문 전용 요소 우선, 뉴스/정부 사이트에 흔한 선택자 포함
     selectors=['#articleBodyContents','#articleBody','#article_body','.article_body',
         '.article-view-content','.article_view','.news_view','.newsview', '.article_txt',
-        '.news-contents','.viewCont','.view_content','.articleContent','article','main']
+        '.news-contents','.viewCont','.view_content','.articleContent',
+        '#newsEndContents','#dic_area','#newsct_article','#article',
+        '[itemprop="articleBody"]','.article-contents','.article-body',
+        '.news_body','article','main']
     candidates=[]
     for css in selectors:
         for node in soup.select(css)[:3]:
@@ -199,6 +204,29 @@ def fetch_fulltext(url: str) -> str:
         pars=[compact(x.get_text(' ',strip=True)) for x in soup.select('p')]
         pars=[p for p in pars if len(normalize(p))>=45]
         if len(pars)>=3: candidates.append(' '.join(pars[:25]))
+    if not candidates:
+        # Some publishers expose the article text via schema.org JSON-LD,
+        # not paragraphs. This is still the actual published articleBody.
+        for raw_ld in ld_json:
+            try:
+                data = json.loads(raw_ld or '{}')
+            except (ValueError, TypeError):
+                continue
+            queue = [data]
+            for _ in range(24):
+                if not queue:
+                    break
+                entry = queue.pop(0)
+                if isinstance(entry, list):
+                    queue.extend(entry[:20])
+                elif isinstance(entry, dict):
+                    body = entry.get('articleBody')
+                    if isinstance(body, str) and len(normalize(body)) >= 260:
+                        candidates.append(compact(body))
+                        break
+                    queue.extend(v for k,v in entry.items() if k in ('@graph', 'mainEntity', 'itemListElement'))
+            if candidates:
+                break
     if not candidates: return ''
     # 많은 페이지에 긴 쿠키/사이드 메뉴가 있으므로 5200자로 제한
     text=max(candidates,key=lambda x:len(x))[:5200]
@@ -321,44 +349,133 @@ def candidate_score(a: dict, today:date) -> float:
     return 40-delta*3 + min(20,len(contents)//240)+numeric*2
 
 
+def _is_google_news_url(url: str) -> bool:
+    try:
+        return (urlsplit(url).hostname or '').lower() == 'news.google.com'
+    except ValueError:
+        return False
+
+
+def _decode_google_rows(rows: list[dict], *, limit: int = 14) -> list[dict]:
+    """Resolve optional Google News RSS wrappers to publisher URLs.
+
+    If Google's undocumented redirect mechanism changes, simply return an
+    empty list. A Google landing page is NEVER treated as a publisher article.
+    """
+    selected = rows[:limit]
+    if not selected:
+        return []
+    try:
+        from gnews_decoder import decode_many
+    except ImportError:
+        print('[원문 수집] Google 뉴스 원문 링크 변환기 미설치 — 직접 언론사 RSS만 사용', flush=True)
+        return []
+    try:
+        mappings = decode_many([r['url'] for r in selected])
+    except Exception as exc:
+        print('[원문 수집] Google 뉴스 원문 링크 변환 불가: '+type(exc).__name__, flush=True)
+        return []
+    if not isinstance(mappings, dict):
+        return []
+    resolved = []
+    for entry in selected:
+        publisher = mappings.get(entry['url'])
+        if (isinstance(publisher, str) and valid_link(publisher)
+                and not _is_google_news_url(publisher)):
+            resolved.append({**entry, 'url': publisher})
+    return resolved
+
+
+def _fetch_verified_entries(items: list[dict], category: str, seen_urls: set[str],
+                            *, trials: int = 22) -> list[dict]:
+    """Try independent publisher articles in parallel, never RSS snippets.
+
+    Publisher article extraction is network-bound; running requests
+    concurrently prevents 15-second timeout pages from blocking the morning
+    job for many minutes. Content is checked exactly as before.
+    """
+    unique = []
+    used = set(seen_urls)
+    for entry in items:
+        url = entry['url']
+        if url in used or _is_google_news_url(url):
+            continue
+        used.add(url)
+        unique.append(entry)
+        if len(unique) >= trials:
+            break
+    if not unique:
+        return []
+    results = []
+    with ThreadPoolExecutor(max_workers=min(6,len(unique))) as executor:
+        futures = {executor.submit(fetch_fulltext, entry['url']): entry for entry in unique}
+        for future in as_completed(futures):
+            entry = futures[future]
+            try:
+                content = future.result()
+            except (ValueError, TypeError, requests.RequestException):
+                continue
+            if len(normalize(content)) < 260 or len(evidence_catalog(content)) < 2:
+                continue
+            info = {**entry, 'category': category, 'content':content}
+            info['candidate_id'] = hashlib.sha256(entry['url'].encode()).hexdigest()[:12]
+            results.append(info)
+    return results
+
+
 def collect_candidates(categories: tuple[str,...], *, today: date | None=None,
                        max_per_category: int=3) -> dict[str,list[dict]]:
-    today=today or datetime.now(KST).date()
-    out={}
-    seen_urls=set()
+    today = today or datetime.now(KST).date()
+    out = {}
+    seen_urls: set[str] = set()
     for category in categories:
-        rows=[]
+        rows = []
         for rss in FEEDS[category]:
             rows += feed_articles(rss)
-        # 공식 보도자료 검색 보완. 구글 뉴스 링크는 원문으로 직접 연결될 때만 채택.
-        query=NEWS_QUERIES[category]
+        # Google News provides relevant headline discovery but most RSS URLs
+        # are *not* direct publisher URLs; they need explicit decoding.
         from urllib.parse import quote
-        rows+=feed_articles('https://news.google.com/rss/search?q='+quote(query)+ '&hl=ko&gl=KR&ceid=KR:ko')
-        plausible=[]
+        rows += feed_articles('https://news.google.com/rss/search?q='+quote(NEWS_QUERIES[category])
+                              + '&hl=ko&gl=KR&ceid=KR:ko')
+        plausible = []
+        used = set()
         for item in rows:
-            if category in CATEGORY_TERMS and not any(term.lower() in item['title'].lower() for term in CATEGORY_TERMS[category]):
+            terms = CATEGORY_TERMS.get(category)
+            if terms and not any(term.lower() in item['title'].lower() for term in terms):
                 continue
-            max_days=7 if category in MEDICAL_CATEGORIES or category=='생활/문화' else 4
-            if not is_recent(item['date'],max_days=max_days,now=today):continue
-            if item['url'] in seen_urls or any(s.lower() in item['title'].lower() for s in BAD_TITLES):continue
-            if len(normalize(item['title']))<15:continue
+            # Medical insurance changes less often than general daily news.
+            # Use a clearly dated recent release, not an invented same-day item.
+            max_days = (16 if category in ('건강보험','보험제도')
+                        else 10 if category in MEDICAL_CATEGORIES or category=='생활/문화'
+                        else 4)
+            if not is_recent(item['date'],max_days=max_days,now=today):
+                continue
+            if item['url'] in seen_urls or item['url'] in used or any(
+                s.lower() in item['title'].lower() for s in BAD_TITLES):
+                continue
+            if len(normalize(item['title'])) < 15:
+                continue
             plausible.append(item)
-        # 최신 기사부터, 전체 기사 URL 읽기 시도 건수를 제한한다.
-        plausible.sort(key=lambda a:a['date'],reverse=True)
-        enriched=[]
-        for entry in plausible[:12]:
-            content=fetch_fulltext(entry['url'])
-            # 본문을 읽을 수 없는 글은 배포하지 않는다.
-            if len(normalize(content))<260 or len(evidence_catalog(content))<2: continue
-            info={**entry,'category':category,'content':content}
-            info['candidate_id']=hashlib.sha256(entry['url'].encode()).hexdigest()[:12]
-            enriched.append(info)
-            if len(enriched)>=max_per_category+2:break
-        enriched.sort(key=lambda x:candidate_score(x,today),reverse=True)
-        out[category]=enriched[:max_per_category]
-        # Show why a category is missing before Gemini is called. Never log article
-        # full text or secret values; counts are sufficient for diagnosis.
-        print(f'[원문 수집] {category}: RSS/검색 {len(rows)}건, 날짜·제목 필터 {len(plausible)}건, 본문 검증 후보 {len(out[category])}건',flush=True)
+            used.add(item['url'])
+        # Prioritize actual publisher links *before* Google RSS wrappers;
+        # the old 'newest 12' rule silently picked 12 Google landing pages.
+        publishers = sorted([a for a in plausible if not _is_google_news_url(a['url'])],
+                            key=lambda a:a['date'], reverse=True)
+        enriched = _fetch_verified_entries(publishers,category,seen_urls,trials=22)
+        googles = sorted([a for a in plausible if _is_google_news_url(a['url'])],
+                         key=lambda a:a['date'], reverse=True)
+        decoded_count = 0
+        if len(enriched) < max_per_category and googles:
+            decoded = _decode_google_rows(googles,limit=14)
+            decoded_count = len(decoded)
+            enriched += _fetch_verified_entries(decoded,category,
+                    seen_urls | {x['url'] for x in enriched},trials=14)
+        # Keep source diversity: score clear real facts, then publication date.
+        enriched.sort(key=lambda x: candidate_score(x,today), reverse=True)
+        out[category] = enriched[:max_per_category]
+        print(f'[원문 수집] {category}: RSS/검색 {len(rows)}건, 날짜·제목 필터 {len(plausible)}건, '
+              f'언론사 직접 링크 {len(publishers)}건, Google 링크 복원 {decoded_count}건, '
+              f'본문 검증 후보 {len(out[category])}건',flush=True)
         seen_urls.update(x['url'] for x in out[category])
     return out
 
