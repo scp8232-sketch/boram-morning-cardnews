@@ -73,3 +73,72 @@ def test_missing_medical_items_blocks_publication(tmp_path):
     with pytest.raises(ValueError, match='5건 미만'):
         render_medical(tmp_path / 'missing-med.png', '2026-11-12', '05:30',
                        [sample(cat, i) for i, cat in enumerate(MED_CATEGORIES[:4])], False)
+
+
+def test_public_card_fits_verified_125_char_text(tmp_path):
+    """A long but verified two-sentence summary must fit without silent clipping.
+
+    The former 98px card/2-line summary layout raised ValueError even though
+    the newsroom correctly accepted 70..125 characters.
+    """
+    summary = ('금융위원회는 구체적인 시행 일정과 적용 대상을 담은 정책을 공개했습니다. '
+               '관계 부처는 현장에 적용할 수 있는 세부 기준과 안내 절차를 검토 중이며, '
+               '국민들은 공식 안내를 통해 각자의 적용 여부를 확인할 수 있습니다.')
+    summary = summary[:125]
+    assert 70 <= len(summary) <= 125
+    headlines = [
+        '정부, 올해 주요 정책 시행 일정과 대상 기관별 안내 계획 공개',
+        '금융당국, 시장 개선 조치와 금융소비자 보호 원칙 함께 점검',
+        '사회 안전망 정비 계획 발표, 이용 절차와 시행 시점 구분',
+        '국제 회의에서 주요 협력 현황과 공동 대응 방안 논의',
+        '생활문화 행사 운영 지침 발표, 시민 참여 방식과 안내 사항 공개',
+    ]
+    rows = []
+    for cat, title in zip(CATEGORIES, headlines):
+        item = sample(cat, 1)
+        item['headline'] = title
+        item['summary'] = summary
+        rows.append(item)
+    target = tmp_path / 'long-verified-morning.png'
+    render_morning(target, '2026-11-15', '23:00', rows, fake_weather(), fake_market(), False)
+    assert target.exists()
+
+
+def test_medical_card_fits_verified_125_char_text(tmp_path):
+    summary = ('건강보험 보장 기준과 진료비 환급 절차를 안내하는 자료가 공개됐습니다. '
+               '가입자는 기존 계약의 보장 범위와 본인부담금을 비교하고, '
+               '신청 대상 여부는 담당 기관의 공식 안내에서 확인해야 합니다.')
+    summary = (summary + ' 자세한 내용은 공지문을 확인하시기 바랍니다.')[:125]
+    assert 70 <= len(summary) <= 125
+    rows = []
+    for cat in MED_CATEGORIES:
+        item = sample(cat, 1)
+        item['headline'] = '건강보험 및 의료 제도 변경과 관련한 신청 대상·기간 안내'
+        item['summary'] = summary
+        rows.append(item)
+    target = tmp_path / 'long-verified-medical.png'
+    render_medical(target, '2026-11-15', '23:00', rows, False)
+    assert target.exists()
+
+
+def test_actual_overflow_is_not_silently_cut(tmp_path):
+    """Grossly oversized unverified content still stops publication."""
+    rows = [sample(cat, i) for i, cat in enumerate(CATEGORIES)]
+    rows[0]['summary'] = '매우 길어서 카드에 담을 수 없는 문장입니다. ' * 100
+    with pytest.raises(ValueError, match='텍스트 초과'):
+        render_morning(tmp_path / 'oversize.png', '2026-11-15', '23:00',
+                       rows, fake_weather(), fake_market(), False)
+
+
+def test_long_realistic_international_report_fits_morning(tmp_path):
+    """Regression for the 2026-11-15 GitHub Action rendering failure."""
+    original = ('젠슨 황 전 엔비디아 최고경영자(CEO)의 퇴진에 미국 중간선거 이후 '
+                '여야 갈등이 영향을 미쳤다는 주장이 나왔습니다. 중국 관영매체가 '
+                '이러한 관점을 담은 논평을 소개하며 정책 영향 가능성도 거론했습니다.')
+    assert 70 <= len(original) <= 125
+    rows = [sample(cat, i) for i, cat in enumerate(CATEGORIES)]
+    rows[3]['headline'] = '중국 관영매체, 젠슨 황 퇴진 배경으로 미국 정치 갈등 거론'
+    rows[3]['summary'] = original
+    target = tmp_path / 'repro-news-overflow.png'
+    render_morning(target, '2026-11-15', '23:00', rows, fake_weather(), fake_market(), False)
+    assert target.exists()

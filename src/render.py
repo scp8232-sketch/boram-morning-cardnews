@@ -162,12 +162,14 @@ def draw_left_articles(im,d,articles):
     for i,(cat,img) in enumerate(zip(cats,imgs)):
         art=by_cat.get(cat)
         if not art:raise ValueError(f'아침뉴스 필수 분야 누락: {cat}')
-        y=166+i*102
-        card_frame(d,y,98)
-        rect(d,(25,y+6,183,y+91),radius=15,fill=BADGE_GRAY)
-        paste(img,im,37,y+24,53,52)
+        # Five rows share the 166..689px news area. 104px cards keep the
+        # approved layout but accommodate a verified 70..125-character summary.
+        # Never cut text with ellipses or silently discard a verified fact.
+        y=166+i*104
+        card_frame(d,y,102)
+        rect(d,(25,y+6,183,y+96),radius=15,fill=BADGE_GRAY)
+        paste(img,im,37,y+25,53,52)
         d=ImageDraw.Draw(im)
-        lab=cat.replace('/','\n') if cat=='생활/문화' else cat
         if cat=='생활/문화':
             txt(d,(109,y+23),'생활',20,True,'#34383e')
             txt(d,(109,y+47),'문화',20,True,'#34383e')
@@ -175,9 +177,14 @@ def draw_left_articles(im,d,articles):
             txt(d,(104,y+29),cat,22,True,'#34383e')
         head=art.get('headline') or art.get('title')
         summary=art.get('summary')
-        n=block(d,(197,y+6),head,554,2,20,23,bold=True,min_size=17)
-        block(d,(197,y+(32 if n==1 else 51)),summary,548,(3 if n==1 else 2),
-              14.6,19.5,min_size=12.7)
+        n=block(d,(197,y+5),head,554,2,20,23,bold=True,min_size=17)
+        # Previous code allowed just two lines after a two-line headline;
+        # that cannot reliably hold the editor's 70..125-character summaries.
+        # Three measured lines fit the 102px news card (no text clipping).
+        if n==1:
+            block(d,(197,y+34),summary,548,3,14.6,18.4,min_size=12.0)
+        else:
+            block(d,(197,y+51),summary,548,3,13.4,16.7,min_size=11.8)
 
 
 def _market_entry(m, key):
@@ -272,8 +279,12 @@ def draw_right_articles(im,d,articles):
         head=a.get('headline') or a.get('title')
         summary=a.get('summary')
         n=block(d,(191,y+18),head,558,2,20.8,25,bold=True,min_size=18)
-        block(d,(191,y+(60 if n==1 else 80)),summary,552,(3 if n==1 else 2),
-              15.4,21.5,min_size=13.3)
+        # Also reserve three lines for two-line medical headlines. The card
+        # has enough vertical room; a verified summary must not be truncated.
+        if n==1:
+            block(d,(191,y+60),summary,552,3,15.4,21.5,min_size=12.5)
+        else:
+            block(d,(191,y+80),summary,552,3,14.5,19.5,min_size=12.0)
 
 
 def save_img(im,path):
