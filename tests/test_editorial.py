@@ -125,7 +125,7 @@ def test_unverifiable_news_remains_blocked_after_one_retry(monkeypatch):
     monkeypatch.setattr(editorial,'_call_gemini',no_facts)
     with pytest.raises(editorial.PublicationQualityError,match='재시도 후'):
         editorial.write_verified_news(candidates)
-    assert len(attempts)==6  # 최초 일괄 1회 + 미검증 다섯 분야의 각 1회
+    assert len(attempts)==3  # 최초 일괄 1회 + 탈락 분야 묶음 재시도 최대 2회
 
 
 def test_passage_ids_grounded_in_actual_article():
@@ -219,3 +219,89 @@ def test_google_news_aggregate_landing_not_taken_as_fulltext(monkeypatch):
         text='<html><main>'+'정책을 발표했습니다. '*100+'</main></html>'
     monkeypatch.setattr(editorial.requests,'get',lambda *a,**kw:R())
     assert editorial.fetch_fulltext('https://news.google.com/articles/123')==''
+
+
+def test_article_title_and_publication_date_count_as_numeric_evidence():
+    body=('기상청은 주말 시민들의 야외활동을 돕기 위해 새로운 예보를 발표했습니다. '
+          '지자체는 시민 안전과 관련한 행사 안내를 공식 홈페이지에 게시했습니다. '
+          '다음 달 관련 안내를 추가로 제공할 계획이라고 관계 기관은 밝혔습니다. ')
+    candidate={'category':'생활/문화','candidate_id':'a1','title':'19일 시민 안전 행사 안내',
+               'date':'2026-11-15','content':body}
+    news={'candidate_id':'a1', 'headline':'19일 시민 안전 행사 안내와 지역 참여 프로그램 소개',
+          'summary':('기상청은 시민들이 야외활동을 준비하도록 새로운 예보를 공개했습니다. '
+                     '지자체도 안전 관련 행사 안내를 홈페이지에 게시했으며 다음 달 추가 안내를 제공할 계획이라고 밝혔습니다.'),
+          'evidence_ids':['E01','E02']}
+    ok, reason=editorial.validate_article(news,candidate)
+    assert ok,reason
+    bad={**news,'headline':news['headline'].replace('19일','999일')}
+    ok, reason=editorial.validate_article(bad,candidate)
+    assert not ok and '원문에 없는 숫자' in reason
+
+
+def test_missing_categories_repaired_together(monkeypatch):
+    monkeypatch.setenv('GEMINI_API_KEY','fake')
+    content=('보건복지부는 지역 보건소의 신청 창구를 새롭게 운영한다고 발표했습니다. '
+             '관계자는 지역 거점에서 관련 서류를 접수하며 현장 안내를 제공한다고 밝혔습니다. '
+             '접수 과정의 혼선을 줄이기 위해 공식 안내를 함께 게시했다고 설명했습니다. ')
+    categories={cat:[{'category':cat,'candidate_id':cat,'content':content,
+                     'title':cat+' 정책 공지','date':'2026-11-15','source':'공식','url':'https://example.com/x'}]
+                for cat in editorial.GENERAL_CATEGORIES}
+    summary=('관계 기관은 지역 보건소의 새 신청 창구를 운영하고 현장 안내를 제공한다고 발표했습니다. '
+             '서류 접수 과정의 혼선을 줄이기 위해 공식 안내도 함께 게시했다고 설명했습니다.')
+    assert 70<=len(summary)<=125
+    calls=[]
+    def mock_call(key, payload, requested, repair_notes=None):
+        calls.append(tuple(requested))
+        def news(cat):
+            return {'category':cat,'candidate_id':cat,
+                    'headline':cat+' 분야 관계 기관이 새로운 신청 창구 운영을 발표',
+                    'summary':summary,'evidence_ids':['E01','E02']}
+        if len(calls)==1:
+            return {'items':[news('정치')]}
+        return {'items':[news(cat) for cat in requested]}
+    monkeypatch.setattr(editorial,'_call_gemini',mock_call)
+    monkeypatch.setattr(editorial,'has_duplicate_topics',lambda items:False)
+    assert len(editorial.write_verified_news(categories))==5
+    assert len(calls)==2
+    assert len(calls[1])==4
+
+
+def test_gemini_retry_503_then_success(monkeypatch):
+    calls=[]
+    class Fail:
+        status_code=503
+        def json(self): return {'error':{'status':'UNAVAILABLE','message':'server busy'}}
+        def raise_for_status(self):
+            err=editorial.requests.HTTPError('503')
+            err.response=self
+            raise err
+    class OK:
+        status_code=200
+        def json(self):return {'candidates':[{'content':{'parts':[{'text':'{"items":[]}'}]}}]}
+        def raise_for_status(self):return None
+    def fake_post(*args,**kwargs):
+        calls.append(1)
+        return Fail() if len(calls)<3 else OK()
+    monkeypatch.setattr(editorial.requests,'post',fake_post)
+    monkeypatch.setattr(editorial.time,'sleep',lambda seconds:None)
+    assert editorial._call_gemini('secret',[],('사회',))=={'items':[]}
+    assert len(calls)==3
+
+
+def test_429_daily_quota_is_not_retried(monkeypatch):
+    calls=[]
+    class Fail:
+        status_code=429
+        def json(self):return {'error':{'status':'RESOURCE_EXHAUSTED', 'message':'Daily quota exceeded per day'}}
+        def raise_for_status(self):
+            exc=editorial.requests.HTTPError('429')
+            exc.response=self
+            raise exc
+    def fake_post(*args,**kwargs):
+        calls.append(1)
+        return Fail()
+    monkeypatch.setattr(editorial.requests,'post',fake_post)
+    with pytest.raises(editorial.GeminiApiRequestError,match='HTTP 429') as exc:
+        editorial._call_gemini('secret',[],('사회',))
+    assert exc.value.retryable is False
+    assert len(calls)==1

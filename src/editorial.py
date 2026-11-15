@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo
@@ -74,6 +75,26 @@ BANNED_FILLER = ('주요 정책의 추진', '향후 논의 방향', '관련 논�
 
 class PublicationQualityError(RuntimeError):
     """검증 불충분 — 고객 발송까지 진행하지 않는다."""
+
+
+class GeminiApiRequestError(RuntimeError):
+    """Sanitized API failure: excludes credentials and complete request/response."""
+    def __init__(self, status: int, code: str, *, retryable: bool = False):
+        self.status, self.code, self.retryable = status, code, retryable
+        super().__init__(f'Gemini API HTTP {status} ({code})' if status else f'Gemini API {code}')
+
+
+def _api_error_details(response):
+    status = int(getattr(response, 'status_code', 0) or 0)
+    code = 'UNKNOWN'
+    try:
+        obj = response.json().get('error', {})
+        if isinstance(obj, dict):
+            code = str(obj.get('status') or obj.get('code') or code)
+    except (ValueError, AttributeError, TypeError):
+        pass
+    code = re.sub(r'[^A-Za-z0-9_\-]', '', code)[:48] or 'UNKNOWN'
+    return status, code
 
 
 def compact(s: str) -> str:
@@ -339,7 +360,7 @@ def collect_candidates(categories: tuple[str,...], *, today: date | None=None,
     return out
 
 
-def _check_details(item:dict, evidence_source:str) -> tuple[bool,str]:
+def _check_details(item:dict, evidence_source:str, *, number_source:str | None=None) -> tuple[bool,str]:
     headline=compact(item.get('headline',''))
     summary=compact(item.get('summary',''))
     if not (18<=len(headline)<=56): return False, '제목이 너무 짧거나 길음'
@@ -354,7 +375,11 @@ def _check_details(item:dict, evidence_source:str) -> tuple[bool,str]:
     if evidence_error: return False, evidence_error
     # AI가 존재하지 않는 통계·날짜를 새로 만들어내는 기본적인 오류 방지.
     numbers=lambda s:set(re.findall(r'\d+(?:[,.]\d+)*',s))
-    missing=numbers(headline+' '+summary)-numbers(evidence_source)
+    # Publication date and the article headline are verified source metadata.
+    # They may contain dates (e.g., "19일") that the downloaded body omits.
+    # Preserve the fail-closed policy for any number absent from all three.
+    scope = evidence_source if number_source is None else number_source
+    missing=numbers(headline+' '+summary)-numbers(scope)
     if missing: return False, f'원문에 없는 숫자 {sorted(missing)[:3]}'
     if len(normalize(summary))<=len(normalize(headline))*1.3:
         return False,'본문이 제목을 충분히 넘어서는 새로운 사실을 제공하지 않음'
@@ -363,7 +388,8 @@ def _check_details(item:dict, evidence_source:str) -> tuple[bool,str]:
 
 def validate_article(item:dict, source:dict) -> tuple[bool,str]:
     if item.get('candidate_id')!=source.get('candidate_id'):return False,'선택 후보와 근거 자료 불일치'
-    return _check_details(item,source.get('content',''))
+    return _check_details(item, source.get('content',''), number_source=' '.join(
+        str(source.get(part, '') or '') for part in ('title', 'date', 'content')))
 
 
 def _call_gemini(key:str, input_payload:list[dict], needed_categories:tuple[str,...],
@@ -408,12 +434,40 @@ summary는 공백과 문장부호를 포함해 **반드시 70~125자**로 작성
     output_schema={'type':'OBJECT', 'properties':{'items':{'type':'ARRAY','items':item_schema}},
                    'required':['items']}
     url='https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent'
-    response=requests.post(url,headers={'x-goog-api-key':key},json={
+    payload={
       'contents':[{'parts':[{'text':instruction+'\n자료(JSON): '+json.dumps(schemas,ensure_ascii=False)}]}],
       'generationConfig':{'responseMimeType':'application/json','responseSchema':output_schema,
                           'temperature':0.05, 'maxOutputTokens':5000}
-    },timeout=95)
-    response.raise_for_status()
+    }
+    # One normal attempt + two bounded retries for transient errors only.
+    # Logs contain HTTP status and API error *class*, never secret keys or text.
+    for attempt in range(3):
+        try:
+            response=requests.post(url,headers={'x-goog-api-key':key},json=payload,timeout=95)
+            response.raise_for_status()
+            break
+        except requests.HTTPError as exc:
+            reply=getattr(exc, 'response', None) or response
+            status,code=_api_error_details(reply)
+            retriable = status in (408,429,500,502,503,504)
+            # A daily quota failure is not resolved by immediate retries.
+            quota_type=''
+            try:
+                details=reply.json().get('error',{}).get('message','')
+                quota_type=details.lower() if isinstance(details,str) else ''
+            except (ValueError,AttributeError,TypeError):
+                pass
+            if status==429 and ('per day' in quota_type or 'daily' in quota_type):
+                retriable=False
+            if retriable and attempt<2:
+                time.sleep(2 ** attempt)
+                continue
+            raise GeminiApiRequestError(status,code,retryable=retriable) from None
+        except (requests.Timeout,requests.ConnectionError) as exc:
+            if attempt<2:
+                time.sleep(2 ** attempt)
+                continue
+            raise GeminiApiRequestError(0,type(exc).__name__,retryable=True) from None
     data=response.json()
     raw=data['candidates'][0]['content']['parts'][0]['text']
     return json.loads(raw)
@@ -468,24 +522,34 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
                 reasons[cat]=reason
                 rejected.append((cat,reason))
 
-    # 일괄 요청에서 이미 통과한 기사는 보존하고 탈락한 기사만 보충한다.
+    # First request checks all categories. Recheck *only missing categories* in
+    # grouped batches, rather than 5 rapid individual calls that can hit free
+    # API request rate limits. Previously approved facts are never rewritten.
+    handled_errors = (requests.RequestException, GeminiApiRequestError,
+                      ValueError, KeyError, IndexError, TypeError)
+    def error_name(exc):
+        return str(exc) if isinstance(exc,GeminiApiRequestError) else type(exc).__name__
+
     try:
         accept_result(_call_gemini(key,flat,intended), intended)
-    except (requests.RequestException,ValueError,KeyError,IndexError,TypeError) as exc:
-        print('[일괄 편집 실패] '+type(exc).__name__+' — 분야별 재시도를 진행합니다.')
+    except handled_errors as exc:
+        print('[일괄 편집 실패] '+error_name(exc)+' — 묶음 재시도로 전환')
+        if isinstance(exc,GeminiApiRequestError) and not exc.retryable:
+            raise PublicationQualityError('Gemini API 호출 실패: '+error_name(exc)) from None
 
-    # 1차 출력의 길이/원문 근거/분야 누락만 별도 AI 요청으로 복구한다.
-    for cat in intended:
-        if cat in approved:continue
-        subset=candidates.get(cat,[])[:3]
-        if not subset:continue
-        why=reasons.get(cat,'출력 형식 또는 분야 누락')
+    for attempt in range(2):
+        pending=tuple(cat for cat in intended if cat not in approved and candidates.get(cat))
+        if not pending:
+            break
+        subset=[a for cat in pending for a in candidates[cat][:3]]
+        repair_notes={cat:reasons.get(cat,'분야 누락 또는 검증 불충분: 다른 후보 또는 원문 근거로 재작성')
+                      for cat in pending}
         try:
-            repaired=_call_gemini(key,subset,(cat,),repair_notes={cat:why})
-            accept_result(repaired,(cat,))
-        except (requests.RequestException,ValueError,KeyError,IndexError,TypeError) as exc:
-            rejected.append((cat,'분야별 재시도 실패: '+type(exc).__name__))
-            print('[기사 재시도 실패] '+cat+': '+type(exc).__name__)
+            accept_result(_call_gemini(key,subset,pending,repair_notes=repair_notes),pending)
+        except handled_errors as exc:
+            print('[묶음 재시도 오류] '+error_name(exc)+' — 남은 분야: '+', '.join(pending))
+            if isinstance(exc,GeminiApiRequestError) and not exc.retryable:
+                break
 
     missing=[cat for cat in intended if cat not in approved]
     if missing:
