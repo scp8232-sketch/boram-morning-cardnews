@@ -395,16 +395,48 @@ def validate_article(item:dict, source:dict) -> tuple[bool,str]:
         str(source.get(part, '') or '') for part in ('title', 'date', 'content')))
 
 
+def _evidence_digest(article: dict, *, max_passages: int = 9) -> dict[str, str]:
+    """Select a short, relevant subset of real source-anchored passage IDs.
+
+    Supplying 4000 chars of prose AND up to 32 passage excerpts often causes
+    needless conditional omissions. The chosen IDs remain in the complete
+    catalog; downstream verification still uses the full downloaded article.
+    """
+    catalog=evidence_catalog(article.get('content',''))
+    if len(catalog)<=max_passages: return catalog
+    tokens={normalize(t) for t in re.findall(r'[가-힣A-Za-z]{2,}',article.get('title',''))
+            if len(normalize(t))>=2}
+    boilerplate=('무단전재','재배포금지','구독신청','로그인','기사제보',
+                 '개인정보처리','저작권','다른 기사','페이지 이동')
+    verbs=('발표','시행','개최','공개','의결','확대','지원','신청','예정',
+           '추진','조사','검토','도입','확정','발급','개편','설명')
+    scored=[]
+    for rank,(eid,passage) in enumerate(catalog.items()):
+        if any(x in passage for x in boilerplate): continue
+        norm=normalize(passage)
+        score=(min(15,sum(1 for t in tokens if t in norm)*3)
+               +min(5,sum(1 for v in verbs if v in passage))
+               +min(5,len(re.findall(r'\d+(?:[,.]\d+)*',passage)))
+               + (2 if 35<=len(passage)<=200 else 0)
+               - rank*.12)
+        scored.append((score,rank,eid,passage))
+    selected=sorted(sorted(scored,reverse=True)[:max_passages],key=lambda x:x[1])
+    if len(selected)<2: return dict(list(catalog.items())[:max_passages])
+    return {eid:p for _,_,eid,p in selected}
+
+
 def _call_gemini(key:str, input_payload:list[dict], needed_categories:tuple[str,...],
                  repair_notes:dict[str,str] | None=None) -> dict:
     """근거 기사 인용·길이 조건이 있는 구조화된 JSON을 요청한다."""
+    # Send only relevant, immutable passage IDs, not the full article twice.
+    # The model's output is still validated against the complete source text.
     schemas=[{'category':a['category'],'candidate_id':a['candidate_id'],
             'title':a['title'],'published':a['date'],
-            'body':a['content'][:4000],
-            'evidence_catalog':evidence_catalog(a['content'])}
+            'evidence_catalog':_evidence_digest(a)}
             for a in input_payload]
     instruction='''당신은 한국어 뉴스 편집자입니다. 고객에게 전달할 뉴스이므로 아래 원문에서 확인되는 사실만 사용하세요.
-각 category별로 근거가 가장 충실하고 중요한 기사 1개를 선택하며, 적절한 기사가 없으면 그 category는 반환하지 마세요.
+각 category에서 원문 근거가 확인되는 중요한 기사 1건을 선택합니다. 제공된 근거 문장이 두 개 이상 있으면 먼저 그 문장들을 바탕으로 완성하세요.
+자료에 없는 사실을 추가하지 마세요. 정말로 서로 다른 사실 근거가 두 개 미만인 경우에만 해당 category를 생략하세요.
 headline은 18~56자이며, 누가 무엇을 했는지 구체적으로 드러나야 합니다.
 summary는 공백과 문장부호를 포함해 **반드시 70~125자**로 작성합니다. 목표는 90~105자입니다.
 요약은 제목을 반복하지 말고 실제 원문에 나온 사실 2~3개를 자연스러운 2문장으로 연결합니다.
@@ -413,12 +445,18 @@ summary는 공백과 문장부호를 포함해 **반드시 70~125자**로 작성
 출처명·신문사명·기사 날짜를 본문 아래에 쓰지 마세요. 헤드라인을 본문 첫머리에 다시 붙이지 마세요.
 정치·의료 정책에서 제안/검토/발표/확정/시행을 혼동하지 마세요. 신약은 연구/비임상/임상/허가/급여를 구분하세요.
 수치를 쓰려면 원문의 숫자 표기를 그대로 쓰고 새로운 수치·기간·일정을 만들어내지 마세요.
-원문에는 사전에 추출한 evidence_catalog가 있습니다. evidence_ids 배열에는 **선택한 후보의 evidence_catalog에서 서로 다른 문장 ID 두 개**(예: ["E03","E07"])만 골라 넣으세요.
+원문 전체를 그대로 붙여 넣지 않고 관련 근거 문장만 압축해 evidence_catalog에 제시했습니다. 이 자료는 기사 원문에서 그대로 추출한 사실입니다.
+각 ID의 문장을 그대로 복사하는 대신 사실을 정확하게 요약하세요. 원문에는 사전에 추출한 evidence_catalog가 있습니다. evidence_ids 배열에는 **선택한 후보의 evidence_catalog에서 서로 다른 문장 ID 두 개**(예: ["E03","E07"])만 골라 넣으세요.
 인용문을 직접 재작성하거나 창작하지 마세요. 두 ID의 근거 문장이 summary의 핵심 사실을 실제로 뒷받침해야 합니다.
 독립적인 사실 2개가 확인되지 않는 후보는 선택하지 마세요.
 응답 전 headline 길이와 summary 길이를 스스로 세고, summary가 70~125자가 아니면 고쳐서 제출하세요.
 반드시 {"items":[{"category":"...","candidate_id":"원문 후보 id","headline":"...","summary":"...","evidence_ids":["E01", "E02"]}]} JSON만 출력하세요.
 요청 카테고리: ''' + ', '.join(needed_categories)
+    if len(needed_categories)==1 and len(input_payload)==1:
+        instruction += ('\n이번 요청은 단 하나의 분야, 단 하나의 확인된 기사입니다. '
+                        '근거 ID가 서로 다른 두 사실을 뒷받침하면 반드시 items에 기사 1개를 반환하세요. '
+                        '단순히 기사 작성이 어렵다는 이유로 빈 목록을 반환하지 마세요. '
+                        '근거가 실제로 부족한 경우에만 빈 배열을 반환하세요.')
     if repair_notes:
         instruction += ('\n이 요청은 1차 출력에서 검증되지 않은 분야의 **재작성**입니다. '
                         '다음 사유를 반드시 해소하세요. 검증 기준을 줄이거나 원문에 없는 사실을 넣어서는 안 됩니다. '

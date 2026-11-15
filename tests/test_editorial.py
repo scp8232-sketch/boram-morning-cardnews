@@ -352,3 +352,46 @@ def test_empty_source_category_has_diagnostic_not_fake_filler(monkeypatch):
     monkeypatch.setattr(editorial,'_call_gemini',lambda *a,**kw:{'items':[]})
     with pytest.raises(editorial.PublicationQualityError,match='원문 전문과 사실 근거가 확인된 기사 후보가 없음'):
         editorial.write_verified_news(candidates)
+
+
+def test_ai_prompt_is_small_and_keeps_source_anchored_ids(monkeypatch):
+    """Regression for the real production omission of politics/culture."""
+    import json
+    captured={}
+    class Reply:
+        def raise_for_status(self): pass
+        def json(self): return {'candidates':[{'content':{'parts':[{'text':'{"items":[]}'}]}}]}
+    def post(url,**kwargs):
+        captured['payload']=kwargs['json']
+        return Reply()
+    monkeypatch.setattr(editorial.requests,'post',post)
+    details=[
+        '정부는 지역별 신청 방식과 참여 기관 명단을 공식 발표했다고 설명했다.',
+        '참여하는 기관들은 11월 15일부터 온라인과 현장 접수 절차를 각각 운영한다.',
+        '신청자는 자격 조건과 신청 마감일을 확인하고 필요한 서류를 제출할 수 있다.',
+        '대상 기관에 대한 세부 내용을 공개하며 주민 상담 창구를 확대한다고 밝혔다.',
+    ]
+    body=' '.join(details*8)
+    article={'category':'정치','candidate_id':'AB12','title':'정부, 지역 신청 절차와 관련 기관 발표',
+             'date':'2026-11-15','content':body}
+    assert editorial._call_gemini('secret',[article],('정치',)) == {'items':[]}
+    prompt=captured['payload']['contents'][0]['parts'][0]['text']
+    source=json.loads(prompt.split('자료(JSON): ',1)[1])[0]
+    assert 'body' not in source
+    assert source['candidate_id']=='AB12'
+    assert len(source['evidence_catalog'])>=2
+    assert all(x in editorial.evidence_catalog(body) for x in source['evidence_catalog'])
+    assert '하나의 분야' in prompt
+
+
+def test_evidence_digest_preserves_evidence_id_original_values():
+    sentences=[
+        '도시 교통정책 협의회에서는 승객 안전 강화 방안과 운영 계획을 발표했다고 설명했다.',
+        '지방자치단체는 주말 대중교통 운행 정보를 온라인으로 별도 공개한다고 밝혔다.',
+        '담당 부서는 2026년 11월 15일부터 교통 안내 서비스를 확대하기로 했다.',
+    ]
+    body=' '.join(sentences*6)
+    ids=editorial._evidence_digest({'content':body,'title':'교통 안내 서비스 확대'})
+    originals=editorial.evidence_catalog(body)
+    assert 2<=len(ids)<=9
+    assert all(originals[k]==v for k,v in ids.items())
