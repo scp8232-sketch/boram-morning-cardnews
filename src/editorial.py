@@ -155,6 +155,7 @@ def fetch_fulltext(url: str) -> str:
         r=requests.get(url,headers=HEADERS,timeout=TIMEOUT)
         r.raise_for_status()
         if not valid_link(r.url): return ''
+        if (urlsplit(r.url).hostname or '').lower().endswith('news.google.com'): return ''
         if 'text/html' not in r.headers.get('Content-Type','text/html'): return ''
     except requests.RequestException:
         return ''
@@ -188,6 +189,108 @@ def fetch_fulltext(url: str) -> str:
             if len(m)>=45 and normalize(m) not in normalize(text): text=m+' '+text
     return compact(text)[:5200]
 
+
+
+def evidence_catalog(fulltext: str, *, max_passages: int = 32) -> dict[str, str]:
+    """Build immutable, source-anchored evidence passages *before* asking AI.
+
+    The model is asked to choose passage IDs, not to copy quotations exactly.
+    IDs are regenerated from the source body at validation time, so fabricated
+    references and paraphrased evidence cannot pass.
+    """
+    text = compact(fulltext)
+    if not text:
+        return {}
+    sentences = re.split(r'(?<=[.!?。])\s+', text)
+    pieces = []
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if len(normalize(sentence)) < 22:
+            continue
+        # Long editorial paragraphs can contain several facts. Split at a word
+        # boundary; each piece remains an unmodified substring of the article.
+        while len(sentence) > 210:
+            i = sentence.rfind(' ', 105, 190)
+            if i < 105: i = 180
+            segment = sentence[:i].strip()
+            if len(normalize(segment)) >= 22:
+                pieces.append(segment)
+            sentence = sentence[i:].strip()
+        if len(normalize(sentence)) >= 22:
+            pieces.append(sentence)
+    if len(pieces) < 2:
+        # Fail closed for articles with no meaningful fact passages.
+        return {}
+    unique=[]
+    used=set()
+    for p in pieces:
+        tag=normalize(p)
+        if tag in used or len(tag) < 22:
+            continue
+        used.add(tag)
+        unique.append(p)
+        if len(unique) >= max_passages:
+            break
+    return {f'E{i:02d}': passage for i, passage in enumerate(unique,1)}
+
+
+def _verified_evidence(item: dict, body: str) -> tuple[list[str], str]:
+    """Resolve selected evidence IDs against the *actual* downloaded article.
+
+    Backward-compatible exact quote support exists for local regression tests,
+    but the live model is instructed to use evidence_ids only.
+    """
+    ids = item.get('evidence_ids')
+    if ids is not None:
+        if not isinstance(ids, list) or len(ids) < 2:
+            return [], '근거 문장 번호 2개 미제출'
+        catalog = evidence_catalog(body)
+        if len(catalog) < 2:
+            return [], '원문에서 독립 근거 2개를 추출하지 못함'
+        if len(set(ids)) < 2:
+            return [], '서로 다른 근거 문장 번호 2개가 필요함'
+        if not all(isinstance(x,str) and x in catalog for x in ids[:4]):
+            return [], '원문에 없는 근거 문장 번호'
+        proofs=[]
+        for idx in ids[:4]:
+            quote=catalog[idx]
+            if normalize(quote) not in [normalize(p) for p in proofs]:
+                proofs.append(quote)
+        return (proofs[:2], '') if len(proofs)>=2 else ([], '독립 근거 문장 2개 미만')
+    # Old exact-quote interface: no fuzzy matching, so invented quotes still fail.
+    evid=item.get('evidence',[])
+    if not isinstance(evid,list) or len(evid)<2:
+        return [], '근거문장 2개 미제출'
+    normalized=normalize(body)
+    proofs=[]
+    for e in evid[:4]:
+        e=compact(e)
+        en=normalize(e)
+        if 14 <= len(en) <= 190 and en in normalized and en not in [normalize(p) for p in proofs]:
+            proofs.append(e)
+    return (proofs[:2], '') if len(proofs)>=2 else ([], '원문과 정확히 일치하는 독립 근거가 2개 미만')
+
+
+def _compact_long_summary(item: dict) -> dict:
+    """Drop only a complete trailing sentence, never chop mid-sentence or add facts.
+
+    Long model outputs are normally retried; this safe fallback is useful when
+    the first complete sentence already carries enough information for the card.
+    """
+    out=dict(item)
+    summary=compact(out.get('summary',''))
+    if 70 <= len(summary) <= 125:
+        out['summary']=summary
+        return out
+    if len(summary)>125:
+        sentences=re.split(r'(?<=[.!?。])\s+',summary)
+        for count in range(len(sentences)-1,0,-1):
+            fragment=' '.join(sentences[:count]).strip()
+            if 70 <= len(fragment) <= 125 and fragment.endswith(('.', '!', '?', '。')):
+                out['summary']=fragment
+                return out
+    out['summary']=summary
+    return out
 
 def candidate_score(a: dict, today:date) -> float:
     delta=max(0,(today-date.fromisoformat(a['date'])).days)
@@ -225,7 +328,7 @@ def collect_candidates(categories: tuple[str,...], *, today: date | None=None,
         for entry in plausible[:12]:
             content=fetch_fulltext(entry['url'])
             # 본문을 읽을 수 없는 글은 배포하지 않는다.
-            if len(normalize(content))<260: continue
+            if len(normalize(content))<260 or len(evidence_catalog(content))<2: continue
             info={**entry,'category':category,'content':content}
             info['candidate_id']=hashlib.sha256(entry['url'].encode()).hexdigest()[:12]
             enriched.append(info)
@@ -247,17 +350,8 @@ def _check_details(item:dict, evidence_source:str) -> tuple[bool,str]:
     h,b=normalize(headline),normalize(summary)
     if b.startswith(h) or (h and b.startswith(h[:min(25,len(h))])):
         return False,'제목을 본문에 재진술'
-    evid=item.get('evidence',[])
-    if not isinstance(evid,list) or len(evid)<2:return False,'근거문장 2개 미제출'
-    normalized=normalize(evidence_source)
-    proofs=[]
-    for e in evid[:4]:
-        e=compact(e)
-        en=normalize(e)
-        if len(en)<14 or len(en)>190 or en not in normalized:
-            continue
-        if en not in proofs: proofs.append(en)
-    if len(proofs)<2:return False,'원문과 정확히 일치하는 독립 근거가 2개 미만'
+    proofs, evidence_error = _verified_evidence(item, evidence_source)
+    if evidence_error: return False, evidence_error
     # AI가 존재하지 않는 통계·날짜를 새로 만들어내는 기본적인 오류 방지.
     numbers=lambda s:set(re.findall(r'\d+(?:[,.]\d+)*',s))
     missing=numbers(headline+' '+summary)-numbers(evidence_source)
@@ -276,7 +370,9 @@ def _call_gemini(key:str, input_payload:list[dict], needed_categories:tuple[str,
                  repair_notes:dict[str,str] | None=None) -> dict:
     """근거 기사 인용·길이 조건이 있는 구조화된 JSON을 요청한다."""
     schemas=[{'category':a['category'],'candidate_id':a['candidate_id'],
-            'title':a['title'],'published':a['date'],'body':a['content'][:4000]}
+            'title':a['title'],'published':a['date'],
+            'body':a['content'][:4000],
+            'evidence_catalog':evidence_catalog(a['content'])}
             for a in input_payload]
     instruction='''당신은 한국어 뉴스 편집자입니다. 고객에게 전달할 뉴스이므로 아래 원문에서 확인되는 사실만 사용하세요.
 각 category별로 근거가 가장 충실하고 중요한 기사 1개를 선택하며, 적절한 기사가 없으면 그 category는 반환하지 마세요.
@@ -288,10 +384,11 @@ summary는 공백과 문장부호를 포함해 **반드시 70~125자**로 작성
 출처명·신문사명·기사 날짜를 본문 아래에 쓰지 마세요. 헤드라인을 본문 첫머리에 다시 붙이지 마세요.
 정치·의료 정책에서 제안/검토/발표/확정/시행을 혼동하지 마세요. 신약은 연구/비임상/임상/허가/급여를 구분하세요.
 수치를 쓰려면 원문의 숫자 표기를 그대로 쓰고 새로운 수치·기간·일정을 만들어내지 마세요.
-evidence 배열에는 선택한 후보의 **본문에서 글자 그대로 복사한 별개 원문 조각 2개**를 넣으세요. 각 조각은 14~80자여야 합니다.
-각 조각은 인용 부호를 제외하고 본문에 그대로 존재해야 하며, 기사의 제목에서 가져오면 안 됩니다.
+원문에는 사전에 추출한 evidence_catalog가 있습니다. evidence_ids 배열에는 **선택한 후보의 evidence_catalog에서 서로 다른 문장 ID 두 개**(예: ["E03","E07"])만 골라 넣으세요.
+인용문을 직접 재작성하거나 창작하지 마세요. 두 ID의 근거 문장이 summary의 핵심 사실을 실제로 뒷받침해야 합니다.
+독립적인 사실 2개가 확인되지 않는 후보는 선택하지 마세요.
 응답 전 headline 길이와 summary 길이를 스스로 세고, summary가 70~125자가 아니면 고쳐서 제출하세요.
-반드시 {"items":[{"category":"...","candidate_id":"원문 후보 id","headline":"...","summary":"...","evidence":["원문 그대로 한 부분", "원문 그대로 다른 부분"]}]} JSON만 출력하세요.
+반드시 {"items":[{"category":"...","candidate_id":"원문 후보 id","headline":"...","summary":"...","evidence_ids":["E01", "E02"]}]} JSON만 출력하세요.
 요청 카테고리: ''' + ', '.join(needed_categories)
     if repair_notes:
         instruction += ('\n이 요청은 1차 출력에서 검증되지 않은 분야의 **재작성**입니다. '
@@ -304,9 +401,9 @@ evidence 배열에는 선택한 후보의 **본문에서 글자 그대로 복사
        'candidate_id':{'type':'STRING'},
        'headline':{'type':'STRING'},
        'summary':{'type':'STRING'},
-       'evidence':{'type':'ARRAY','items':{'type':'STRING'}}
+       'evidence_ids':{'type':'ARRAY','items':{'type':'STRING'}}
       },
-      'required':['category','candidate_id','headline','summary','evidence']
+      'required':['category','candidate_id','headline','summary','evidence_ids']
     }
     output_schema={'type':'OBJECT', 'properties':{'items':{'type':'ARRAY','items':item_schema}},
                    'required':['items']}
@@ -341,6 +438,7 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
         arrived=set()
         for item in res['items']:
             if not isinstance(item,dict):continue
+            item=_compact_long_summary(item)
             cat=item.get('category')
             if cat not in requested or cat in approved:continue
             arrived.add(cat)
@@ -355,7 +453,7 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
                       'headline':compact(item['headline']),
                       'summary':compact(item['summary']),'date':source['date'],
                       'source':source['source'],'url':source['url'],
-                      'fact_proofs':[{'quote':compact(quote)[:80]} for quote in item['evidence'][:2]],
+                      'fact_proofs':[{'quote':compact(quote)[:180]} for quote in _verified_evidence(item,source['content'])[0]],
                       'fact_content_hash':hashlib.sha256(source['content'].encode()).hexdigest()[:16],
                     }
                     reasons.pop(cat,None)

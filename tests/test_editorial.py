@@ -126,3 +126,96 @@ def test_unverifiable_news_remains_blocked_after_one_retry(monkeypatch):
     with pytest.raises(editorial.PublicationQualityError,match='재시도 후'):
         editorial.write_verified_news(candidates)
     assert len(attempts)==6  # 최초 일괄 1회 + 미검증 다섯 분야의 각 1회
+
+
+def test_passage_ids_grounded_in_actual_article():
+    """AI chooses existing sentence IDs; it cannot make up precise quotations."""
+    content=('금융위원회는 11월 13일 한국거래소에서 자본시장 정책 간담회를 개최했다. '
+             '참석한 전문가들은 기업가치 저평가 문제와 소액주주 보호 제도의 개선 방안을 논의했다. '
+             '간담회에서는 의무공개매수제도에 관한 여러 방안이 검토 대상에 포함됐다. '
+             '금융위원회는 이날 제도의 확정과 실제 시행 여부를 발표하지 않았다. ')
+    snippets=editorial.evidence_catalog(content)
+    assert len(snippets)>=3, snippets
+    news={'headline':'금융위, 자본시장 정책 간담회에서 소액주주 보호 논의',
+          'summary':('금융위가 한국거래소에서 자본시장 정책 간담회를 열고 기업가치 저평가 문제와 소액주주 보호 방안을 다뤘습니다. '
+                     '의무공개매수제도도 검토 대상에 포함됐지만 실제 시행은 확정하지 않았습니다.'),
+          'evidence_ids':['E01','E02']}
+    # Long strings are not silently cut off: ensure explicit limit and evidence
+    assert len(news['summary'])<=125
+    ok,why=editorial._check_details(news,content)
+    assert ok,why
+    cited,_=editorial._verified_evidence(news,content)
+    assert cited==[snippets['E01'],snippets['E02']]
+
+
+def test_fabricated_passage_id_fails_closed():
+    content=('금융위원회는 11월 13일 한국거래소에서 자본시장 간담회를 개최했다고 설명했다. '
+             '현장 참석자들은 기업가치 제고를 위한 정책 필요성을 논의했다고 밝혔다. '
+             '관련 의견은 앞으로 별도로 검토할 예정이라고 덧붙였다. ')
+    news={'headline':'금융위원회, 거래소에서 자본시장 간담회 개최',
+          'summary':('금융위원회는 한국거래소에서 자본시장 간담회를 개최했습니다. 참석자들은 기업가치 제고를 위한 개선방안을 논의했으며 후속 검토가 필요하다는 의견을 전달했습니다.'),
+          'evidence_ids':['E01','E99']}
+    ok,reason=editorial._check_details(news,content)
+    assert not ok and '없는 근거 문장 번호' in reason
+
+
+def test_long_summary_only_removes_whole_trailing_sentence():
+    first=('금융위원회가 자본시장 제도개선 간담회를 열고 소액주주 보호에 대한 여러 방안을 제시했습니다. '
+           '기업가치 저평가 문제도 논의했습니다.')
+    ending=' 이번 논의에서는 제안 단계의 제도를 확정된 시행 방침과 구분해야 한다는 설명을 덧붙였습니다. 아직 구체적 일정은 결정되지 않았습니다.'
+    assert 70<=len(first)<=125 and len(first+ending)>125
+    result=editorial._compact_long_summary({'summary':first+ending})
+    assert result['summary'].startswith(first)
+    assert 70 <= len(result['summary']) <= 125
+    assert result['summary'].endswith('.')
+    assert result['summary'] in (first, (first + ending).rsplit(' ', 5)[0]) or result['summary'] == (first + ' 이번 논의에서는 제안 단계의 제도를 확정된 시행 방침과 구분해야 한다는 설명을 덧붙였습니다.')
+
+
+def test_model_receives_source_generated_ids_not_fake_quotes(monkeypatch):
+    captured={}
+    class Response:
+        def raise_for_status(self):pass
+        def json(self):return {'candidates':[{'content':{'parts':[{'text':'{"items":[]}'}]}}]}
+    def fake_post(url, **kw):
+        captured.update(kw)
+        return Response()
+    monkeypatch.setattr(editorial.requests,'post',fake_post)
+    body=('국민건강보험공단은 보험료 환급금 관련 신청 절차를 공개했다고 발표했다. '
+          '가입자는 공식 홈페이지와 모바일 앱에서 본인 인증을 거쳐 조회할 수 있다. '
+          '일부 환급금은 신청 기한을 넘기면 소멸할 수 있어 기한을 확인하도록 안내했다.')
+    result=editorial._call_gemini('test-key',[{'category':'건강보험','candidate_id':'x',
+              'title':'국민건강보험공단 환급금 안내','date':'2026-11-15','content':body}],('건강보험',))
+    assert result == {'items':[]}
+    payload=captured['json']
+    sent=payload['contents'][0]['parts'][0]['text']
+    assert 'evidence_catalog' in sent
+    assert 'E01' in sent and 'E02' in sent
+    assert 'evidence_ids' in payload['generationConfig']['responseSchema']['properties']['items']['items']['required']
+    assert 'test-key' not in sent
+
+
+def test_evidence_catalog_rejects_single_short_repeated_chunk():
+    assert editorial.evidence_catalog('짧은 안내입니다.') == {}
+    assert editorial.evidence_catalog('동일한 공지 내용이 반복되는 문장입니다. '*5) == {}
+
+
+def test_invalid_summary_number_cannot_pass_with_valid_ids():
+    content=('금융위원회는 11월 13일 정책 간담회를 열고 기업가치 제고 방안을 논의했다. '
+             '관련 전문가들은 소액주주 보호와 시장제도 개선 방향에 대한 의견을 제시했다. '
+             '구체적인 후속 일정은 당일 별도로 확정되지 않았다고 담당자가 설명했다. ')
+    x={'headline':'금융위원회, 정책 간담회에서 제도 개선 방안 논의',
+       'summary':('금융위원회가 간담회에서 기업가치 제고 방안을 논의했고 소액주주 보호 정책을 검토했습니다. '
+                  '참석자들은 9999개 상장사에 해당 제도를 적용하기로 확정했다고 밝혔습니다.'),
+       'evidence_ids':['E01','E02']}
+    ok,reason=editorial._check_details(x,content)
+    assert not ok and '원문에 없는 숫자' in reason
+
+
+def test_google_news_aggregate_landing_not_taken_as_fulltext(monkeypatch):
+    class R:
+        url='https://news.google.com/articles/123'
+        headers={'Content-Type':'text/html'}
+        def raise_for_status(self):pass
+        text='<html><main>'+'정책을 발표했습니다. '*100+'</main></html>'
+    monkeypatch.setattr(editorial.requests,'get',lambda *a,**kw:R())
+    assert editorial.fetch_fulltext('https://news.google.com/articles/123')==''
