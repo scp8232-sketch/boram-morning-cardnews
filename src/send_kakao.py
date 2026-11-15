@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import time
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
@@ -90,8 +91,31 @@ def send_one(token: str, title: str, image_url: str, original_url: str, date: st
         raise RuntimeError('카카오 API 응답이 발송 성공 코드가 아닙니다.')
 
 
+def generated_card_date() -> str:
+    """생성된 카드의 실제 발행 날짜를 사용한다. 자정을 넘어도 오늘 날짜를 새로 계산하지 않는다."""
+    index = ROOT / 'docs' / 'index.html'
+    if not index.is_file():
+        raise RuntimeError('카드뉴스 목록 파일이 없습니다. 이미지 생성·배포 단계를 확인하세요.')
+    page = index.read_text(encoding='utf-8')
+    match = re.search(r'url\s*=\s*(\d{4}-\d{2}-\d{2})/', page, re.IGNORECASE)
+    if not match:
+        raise RuntimeError('카드뉴스 목록에서 발행 날짜를 확인하지 못했습니다.')
+    published = match.group(1)
+    # 이전 실행의 오래된 카드를 새 카드로 오인해 전송하지 않도록 한다.
+    age = (datetime.now(KST).date() - datetime.strptime(published, '%Y-%m-%d').date()).days
+    if age not in (0, 1):
+        raise RuntimeError('발행 날짜가 최신이 아닙니다. 오늘 카드가 정상 생성됐는지 확인하세요.')
+    image_folder = ROOT / 'docs' / published
+    for key in ('morning', 'medical'):
+        for name in (f'{key}.png', f'{key}-preview.jpg'):
+            if not (image_folder / name).is_file():
+                raise RuntimeError(f'발행 파일이 없습니다: {published}/{name}')
+    print(f'발행 날짜 확인: {published} (현재 한국 시간과 달라도 생성된 카드 날짜를 사용합니다)')
+    return published
+
+
 def main():
-    date = datetime.now(KST).strftime('%Y-%m-%d')
+    date = generated_card_date()
     base = os.environ.get('PAGES_BASE_URL', '').strip()
     if not base.startswith('https://'):
         raise RuntimeError('GitHub Pages 배포 주소를 먼저 설정해야 합니다.')
