@@ -395,3 +395,103 @@ def test_evidence_digest_preserves_evidence_id_original_values():
     originals=editorial.evidence_catalog(body)
     assert 2<=len(ids)<=9
     assert all(originals[k]==v for k,v in ids.items())
+
+
+def _long_factual_source():
+    """Entirely fictional text for testing; must never be published as news."""
+    sentences = [
+        '금융위원회는 11월 15일 한국거래소에서 자본시장 정책 간담회를 열었다.',
+        '참석자들은 소액주주 보호와 기업가치 저평가 개선을 위한 여러 대안을 논의했다.',
+        '회의에는 주식시장 거래 제도를 연구하는 전문가와 금융회사 관계자들이 참석했다.',
+        '금융위원회는 간담회에서 제안된 의견을 수렴해 개선 필요성을 검토하겠다고 밝혔다.',
+        '이번 간담회는 당일 토론으로 마무리됐으며 제도 시행일은 별도로 확정되지 않았다.',
+        '정부는 논의 과정에서 관련 의견을 폭넓게 검토해 이후 계획에 반영하겠다고 설명했다.',
+        '전문가들은 인수합병 가격 산정 방식과 상장기업의 주주권 행사 방안에 대해서도 의견을 제시했다고 밝혔다.',
+        '설명자료에는 참석 기관별 발표 순서와 회의에서 토의된 쟁점의 목록도 함께 실렸다.',
+    ]
+    return {
+        'category':'경제', 'candidate_id':'test-fallback-eco',
+        'title':'금융위원회 자본시장 정책 간담회서 주주 보호 방안 논의',
+        'date':'2026-11-15', 'url':'https://example.org/example-news',
+        'source':'실험용 가상 기사', 'content':' '.join(sentences),
+    }
+
+
+def test_source_extractive_fallback_has_two_genuine_complete_facts():
+    source=_long_factual_source()
+    result=editorial._safe_extractive_fallback(source)
+    assert result is not None
+    assert len(result['evidence_ids']) == 2
+    assert result['evidence_ids'][0] != result['evidence_ids'][1]
+    assert 70 <= len(result['summary']) <= 125
+    assert '11월 15일' in result['summary']
+    assert '소액주주 보호' in result['summary']
+    assert result['summary'].endswith('습니다.')
+    assert '한국거래소에서' in result['summary']
+    assert editorial.validate_article(result,source)[0]
+
+
+def test_fallback_never_uses_unverified_or_repeated_generic_prose():
+    source=_long_factual_source()
+    source['content']='정부가 관련 정책을 발표했다고 밝혔다. '*24
+    assert editorial._safe_extractive_fallback(source) is None
+    source['content']='금융위원회는 11월 15일 간담회를 개최했다.' * 30
+    assert editorial._safe_extractive_fallback(source) is None
+    source=_long_factual_source()
+    source['title']='긴 제목의 정책 논의…'
+    assert editorial._safe_extractive_fallback(source) is None
+
+
+def test_missing_ai_article_can_use_verified_source_without_fabrication(monkeypatch):
+    monkeypatch.setenv('GEMINI_API_KEY','fake-test-key')
+    monkeypatch.setattr(editorial,'_call_gemini',lambda key, rows, cats, repair_notes=None: {'items':[]})
+    original=_long_factual_source()
+    categories={}
+    for idx,category in enumerate(editorial.GENERAL_CATEGORIES):
+        src=dict(original)
+        src.update({'category':category, 'candidate_id':f'fallback-{idx}',
+                    'title': f'{category} | '+original['title'],
+                    'url':f'https://example.org/fallback-{idx}'})
+        # Same factual article across fields would violate editorial diversity;
+        # this test asserts source fallback correctness, not taxonomy selection.
+        categories[category]=[src]
+    monkeypatch.setattr(editorial,'has_duplicate_topics',lambda x:False)
+    result=editorial.write_verified_news(categories)
+    assert len(result)==5
+    assert all(x['selection_mode']=='extractive_fallback' for x in result)
+    assert all(x['fact_proofs'] and x['fact_content_hash'] for x in result)
+    assert all('소액주주 보호' in x['summary'] for x in result)
+
+
+def test_extractive_fallback_rejects_unsupported_false_specificity():
+    source=_long_factual_source()
+    result=editorial._safe_extractive_fallback(source)
+    assert result
+    manipulated=dict(result,summary=result['summary']+' 9000명에게도 지원한다.')
+    ok,why=editorial.validate_article(manipulated,source)
+    assert not ok
+    assert '길이' in why or '원문에 없는 숫자' in why
+
+
+def test_fallback_requires_https_news_url():
+    source=_long_factual_source()
+    source['url']='file:///etc/private-file'
+    assert editorial._safe_extractive_fallback(source) is None
+
+
+def test_verified_ai_content_is_not_overwritten_by_fallback(monkeypatch):
+    monkeypatch.setenv('GEMINI_API_KEY','fake-test-key')
+    source=_long_factual_source()
+    categories={k:[] for k in editorial.GENERAL_CATEGORIES}
+    src=dict(source,category='경제')
+    categories['경제']=[src]
+    # Non-existent categories are still a blocker, and the valid AI item is
+    # retained rather than replaced by the fallback.
+    valid=editorial._safe_extractive_fallback(src)
+    assert valid is not None
+    edited=dict(valid,headline='금융당국, 주식시장 제도 개선 방안 집중 논의')
+    assert editorial.validate_article(edited, src)[0]
+    monkeypatch.setattr(editorial,'_call_gemini',lambda key, rows, cats, repair_notes=None:{'items':[edited]})
+    with pytest.raises(editorial.PublicationQualityError, match='검증 미통과') as exc:
+        editorial.write_verified_news(categories)
+    assert '경제' not in str(exc.value)

@@ -514,6 +514,140 @@ summary는 공백과 문장부호를 포함해 **반드시 70~125자**로 작성
     return json.loads(raw)
 
 
+
+
+def _fallback_sentence_candidates(article: dict) -> list[tuple[float, str, str]]:
+    """Find complete, concrete statements that occur verbatim in a fetched article.
+
+    This is an emergency *source-extractive* path, not a way to manufacture news.
+    Discard fragments produced by evidence_catalog's long-paragraph splitting.
+    """
+    body = compact(article.get('content', ''))
+    title = compact(article.get('title', ''))
+    if not valid_link(article.get('url','')) or len(normalize(body)) < 260 or not (18 <= len(title) <= 56):
+        return []
+    if any(x.lower() in title.lower() for x in BAD_TITLES + BANNED_FILLER):
+        return []
+    catalog = evidence_catalog(body)
+    title_terms = {normalize(x) for x in re.findall(r'[가-힣A-Za-z]{2,}', title)
+                   if len(normalize(x)) >= 2 and x not in ('관련', '대한', '추진', '오늘', '내일', '한국', '정부', '발표')}
+    boilerplate = ('무단전재', '재배포', '제보', '기사제공', '구독', 'ⓒ',
+                   '사진=', '기자=', 'Copyright', 'All Rights Reserved',
+                   '기자]', '이미지 크게 보기', '개인정보', '저작권', '관련기사')
+    action_terms = ('발표', '개최', '진행', '확정', '의결', '통과', '신청', '접수',
+                    '운영', '시행', '확대', '감소', '증가', '지원', '설치', '제공',
+                    '열었', '논의', '설명', '다뤘', '찾았', '열린', '출범', '착공',
+                    '밝혔', '공개', '출시', '착수', '조사', '발급', '선정', '전달',
+                    '완료', '준비', '개정', '예정', '참여', '도입', '집계', '제출')
+    chosen = []
+    seen = set()
+    for index, (eid, passage) in enumerate(catalog.items()):
+        sentence = compact(passage)
+        identifier = normalize(sentence)
+        if identifier in seen or not (27 <= len(sentence) <= 95):
+            continue
+        if not sentence.endswith(('.', '!', '?', '。')):
+            continue
+        if not re.search(r'[가-힣]', sentence):
+            continue
+        if any(b.lower() in sentence.lower() for b in boilerplate + BANNED_FILLER):
+            continue
+        # Exclude weak detached fragments and boilerplate. Require an actual
+        # action and a topic anchor, not just a sentence-shaped generality.
+        if not any(term in sentence for term in action_terms):
+            continue
+        overlap = sum(1 for t in title_terms if t in normalize(sentence))
+        specific = bool(re.search(r'\d{1,4}(?:[.,]\d+)?(?:년|월|일|명|곳|개|원|%|건|차례)|'
+                                  r'\d{1,4}년|\d{1,2}월|\d+%', sentence))
+        institution = any(w in sentence for w in (
+            '금융위원회','행정안전부','질병관리청','복지부','보험공단','시청',
+            '국회','정부','법원','경찰','한국은행','교육부','대통령','한국거래소',
+            '서울시','보건복지부','기상청','지방자치단체','공단','위원회'))
+        if not (specific or institution or overlap >= 2):
+            continue
+        score = min(8, overlap * 2) + (3 if specific else 0) + (2 if institution else 0) - index * .15
+        chosen.append((score, eid, sentence))
+        seen.add(identifier)
+    return chosen
+
+
+
+
+def _formalize_source_sentence(sentence: str) -> str:
+    """Only convert common past/statement endings to polite news style.
+
+    This never changes dates, actors, events, negation or modal language; all
+    factual statements still come from original source passages.
+    """
+    replacements = (
+        ('밝혔다.', '밝혔습니다.'), ('말했다.', '말했습니다.'),
+        ('알렸다.', '알렸습니다.'), ('열었다.', '열었습니다.'),
+        ('논의했다.', '논의했습니다.'), ('설명했다.', '설명했습니다.'),
+        ('제시했다.', '제시했습니다.'), ('진행했다.', '진행했습니다.'),
+        ('검토했다.', '검토했습니다.'), ('운영했다.', '운영했습니다.'),
+        ('출범했다.', '출범했습니다.'), ('시행했다.', '시행했습니다.'),
+        ('확대했다.', '확대했습니다.'), ('발표했다.', '발표했습니다.'),
+        ('개최했다.', '개최했습니다.'), ('결정했다.', '결정했습니다.'),
+        ('확정했다.', '확정했습니다.'), ('통과했다.', '통과했습니다.'),
+        ('공개했다.', '공개했습니다.'), ('완료했다.', '완료했습니다.'),
+        ('조사했다.', '조사했습니다.'), ('변경했다.', '변경했습니다.'),
+        ('연구했다.', '연구했습니다.'), ('참여했다.', '참여했습니다.'),
+        ('계획했다.', '계획했습니다.'), ('선정했다.', '선정했습니다.'),
+        ('확인했다.', '확인했습니다.'), ('지원했다.', '지원했습니다.'),
+        ('나왔다.', '나왔습니다.'), ('시작했다.', '시작했습니다.'),
+        ('도입했다.', '도입했습니다.'), ('예정이다.', '예정입니다.'),
+        ('예정이라고 했다.', '예정이라고 했습니다.'),
+        ('했다.', '했습니다.'), ('됐다.', '됐습니다.'),
+        ('되었다.', '되었습니다.'), ('있다.', '있습니다.'),
+        ('없다.', '없습니다.'), ('한다.', '합니다.'), ('된다.', '됩니다.'),
+    )
+    for old, new in replacements:
+        if sentence.endswith(old):
+            return sentence[:-len(old)] + new
+    return sentence
+
+
+def _safe_extractive_fallback(article: dict) -> dict | None:
+    """Return a short exact-source fallback only with two independent facts.
+
+    Do not break clauses mid-sentence or pad with unsupported editorial text.
+    The candidate headline is its actual RSS title, and the body consists of
+    two short *complete* source statements, with only polite ending changes. A failed check means no fallback.
+    """
+    sentences = _fallback_sentence_candidates(article)
+    if len(sentences) < 2:
+        return None
+    # Original article order is preferred over sensational or scattered facts.
+    ranked=[]
+    for i, (score_a, eid_a, text_a) in enumerate(sentences):
+        for score_b, eid_b, text_b in sentences[i+1:]:
+            # The same fact repeated with small changes is not two facts.
+            tokens_a = {x for x in re.findall(r'[가-힣A-Za-z]{3,}', text_a)
+                        if x not in ('정부는','이날은','관계자는','이번에는')}
+            tokens_b = {x for x in re.findall(r'[가-힣A-Za-z]{3,}', text_b)
+                        if x not in ('정부는','이날은','관계자는','이번에는')}
+            if tokens_a and tokens_b and len(tokens_a & tokens_b) / min(len(tokens_a), len(tokens_b)) > .82:
+                continue
+            summary = _formalize_source_sentence(text_a) + ' ' + _formalize_source_sentence(text_b)
+            if not (70 <= len(summary) <= 125):
+                continue
+            # Conservative copyright guard: never use more than 25 whitespace
+            # separated words verbatim from a single private news source.
+            if len(summary.split()) > 25:
+                continue
+            fallback = {'category':article.get('category'),
+                        'candidate_id':article.get('candidate_id'),
+                        'headline':compact(article.get('title','')),
+                        'summary':summary, 'evidence_ids':[eid_a,eid_b]}
+            ok, _ = validate_article(fallback, article)
+            if not ok:
+                continue
+            ranked.append((score_a + score_b, -i, fallback))
+    if not ranked:
+        return None
+    return max(ranked, key=lambda x:(x[0], x[1]))[2]
+
+
 def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) -> list[dict]:
     key=os.environ.get('GEMINI_API_KEY','').strip()
     if not key:raise PublicationQualityError('GEMINI_API_KEY 없음: 기사 본문을 자동 제작하지 않습니다.')
@@ -609,6 +743,34 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
                     raise PublicationQualityError('Gemini API 호출 실패: '+error_name(exc)) from None
         if cat not in approved and cat not in reasons:
             reasons[cat]='확인된 원문 후보가 있지만 AI가 근거를 검증하지 못함'
+
+    # Last resort: two *complete* facts copied from the same verified source.
+    # If AI omits a field, do not hallucinate, weaken checks, or fill with
+    # policy boilerplate. This only succeeds for a sufficiently rich article.
+    for cat in intended:
+        if cat in approved:
+            continue
+        for candidate in candidates.get(cat, [])[:3]:
+            fallback = _safe_extractive_fallback(candidate)
+            if fallback is None:
+                continue
+            evidence, _ = _verified_evidence(fallback, candidate['content'])
+            approved[cat] = {
+                'category':cat, 'title':candidate['title'],
+                'headline':fallback['headline'], 'summary':fallback['summary'],
+                'date':candidate['date'], 'source':candidate['source'],
+                'url':candidate['url'],
+                'fact_proofs':[{'quote':compact(e)[:180]} for e in evidence],
+                'fact_content_hash':hashlib.sha256(candidate['content'].encode()).hexdigest()[:16],
+                'selection_mode':'extractive_fallback',
+            }
+            reasons.pop(cat, None)
+            print(f'[검증된 원문 기반 대체] {cat}: 독립 근거 2개, 70~125자 요약 확인', flush=True)
+            break
+        if cat not in approved:
+            reasons[cat] = (reasons.get(cat, '검증 가능한 AI 기사 없음')
+                            + ' / 원문 기반 대체도 사실 문장 2개·길이 기준 미충족')
+            print(f'[원문 기반 대체 불가] {cat}: 완전한 사실 문장 두 개 및 길이 기준 미충족', flush=True)
 
     missing=[cat for cat in intended if cat not in approved]
     if missing:
