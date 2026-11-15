@@ -73,3 +73,56 @@ def test_direct_rss_parsing():
     row=editorial.parse_feed(xml)[0]
     assert row['date']=='2026-11-13'
     assert 'yna.co.kr' in row['url']
+
+
+def test_short_news_is_regenerated_without_relaxing_quality(monkeypatch):
+    """회귀검사: 기존 11/15 장애(짧은 기사 설명)가 다시 발행 중단을 일으키지 않게 한다."""
+    monkeypatch.setenv('GEMINI_API_KEY','unit-test-key')
+    parts=[
+        '담당 기관은 지역별 신청 절차와 접수 방식을 구체적으로 발표했다.',
+        '현장 접수 창구와 온라인 접수 창구를 별도로 운영한다고 밝혔다.',
+    ]
+    good_summary=('담당 기관은 지역별 신청 방법을 나누고 현장 창구와 온라인 접수 절차를 구분해 운영한다고 설명했습니다. '
+                  '접수 방식을 구체적으로 발표하면서 대상자들이 이용할 수 있는 행정 절차를 함께 공개했습니다.')
+    assert 70 <= len(good_summary) <= 125
+    candidates={}
+    for cat in editorial.GENERAL_CATEGORIES:
+        candidates[cat]=[{'candidate_id':cat,'category':cat,'title':cat+' 분야 행정 조치 안내',
+                          'date':'2026-11-15','url':'https://example.com/'+cat,
+                          'source':'검사원문',
+                          'content':'해당 분야의 공식 발표 전문입니다. '*20+parts[0]+' '+parts[1]}]
+    def make_item(cat, summary=good_summary):
+        return {'category':cat,'candidate_id':cat,
+                'headline':cat+' 분야 담당 기관이 새로운 행정 조치를 발표했습니다',
+                'summary':summary,'evidence':parts}
+    calls=[]
+    def fake_model(key, rows, categories, repair_notes=None):
+        calls.append((categories,repair_notes))
+        if repair_notes:
+            return {'items':[make_item(categories[0])]}
+        return {'items':[make_item(cat,'관련 내용이 발표되었습니다.' if cat=='정치' else good_summary)
+                         for cat in categories]}
+    monkeypatch.setattr(editorial,'_call_gemini',fake_model)
+    monkeypatch.setattr(editorial,'has_duplicate_topics',lambda items:False)
+    result=editorial.write_verified_news(candidates)
+    assert len(result)==5
+    assert len(calls)==2
+    assert calls[1][0]==('정치',)
+    assert '길이' in calls[1][1]['정치']
+
+
+def test_unverifiable_news_remains_blocked_after_one_retry(monkeypatch):
+    monkeypatch.setenv('GEMINI_API_KEY','unit-test-key')
+    candidates={cat:[{'candidate_id':cat,'category':cat,
+                    'title':cat+' 분야 원문', 'date':'2026-11-15',
+                    'url':'https://example.com/foo','source':'원문',
+                    'content':'확인된 원문 내용을 공개합니다. '*30}]
+                for cat in editorial.GENERAL_CATEGORIES}
+    attempts=[]
+    def no_facts(key,rows,categories,repair_notes=None):
+        attempts.append(categories)
+        return {'items':[]}
+    monkeypatch.setattr(editorial,'_call_gemini',no_facts)
+    with pytest.raises(editorial.PublicationQualityError,match='재시도 후'):
+        editorial.write_verified_news(candidates)
+    assert len(attempts)==6  # 최초 일괄 1회 + 미검증 다섯 분야의 각 1회

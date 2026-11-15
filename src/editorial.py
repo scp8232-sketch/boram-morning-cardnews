@@ -240,7 +240,7 @@ def _check_details(item:dict, evidence_source:str) -> tuple[bool,str]:
     headline=compact(item.get('headline',''))
     summary=compact(item.get('summary',''))
     if not (18<=len(headline)<=56): return False, '제목이 너무 짧거나 길음'
-    if not (70<=len(summary)<=125): return False, '설명은 70~125자로, 확인된 사실을 2~3개 포함해야 함'
+    if not (70<=len(summary)<=125): return False, f'설명 길이 {len(summary)}자(필요: 70~125자), 확인된 사실을 2~3개 포함해야 함'
     if not re.search(r'[가-힣]',headline+summary): return False,'한글 뉴스 문장이 아님'
     if any(x in headline+summary for x in BANNED_FILLER): return False,'공허한 상투적 표현'
     if '…' in headline or '...' in headline: return False,'제목이 잘림'
@@ -272,25 +272,49 @@ def validate_article(item:dict, source:dict) -> tuple[bool,str]:
     return _check_details(item,source.get('content',''))
 
 
-def _call_gemini(key:str, input_payload:list[dict], needed_categories:tuple[str,...]) -> dict:
+def _call_gemini(key:str, input_payload:list[dict], needed_categories:tuple[str,...],
+                 repair_notes:dict[str,str] | None=None) -> dict:
+    """근거 기사 인용·길이 조건이 있는 구조화된 JSON을 요청한다."""
     schemas=[{'category':a['category'],'candidate_id':a['candidate_id'],
             'title':a['title'],'published':a['date'],'body':a['content'][:4000]}
             for a in input_payload]
     instruction='''당신은 한국어 뉴스 편집자입니다. 고객에게 전달할 뉴스이므로 아래 원문에서 확인되는 사실만 사용하세요.
 각 category별로 근거가 가장 충실하고 중요한 기사 1개를 선택하며, 적절한 기사가 없으면 그 category는 반환하지 마세요.
-각 뉴스의 제목은 누가 무엇을 어떻게 했는지 드러나야 하며, summary는 제목을 반복하지 않고 새로운 사실 2~3개를 연결된 2문장(약 85~115자)으로 자세히 설명해야 합니다.
-무조건 ‘누가/무엇을/언제/대상/구체적인 수치 또는 실행 조치’ 중 최소 3개 정보가 포함되어야 합니다.
-예: 제목 ‘금융위, 자본시장 간담회 개최’; 본문 ‘금융위는 13일 한국거래소에서 간담회를 열고 저평가 상장사 문제와 M&A 주주 보호 대책을 다뤘습니다. 참석 전문가들이 제안한 대책은 확정·시행된 제도와 구별해야 합니다.’
+headline은 18~56자이며, 누가 무엇을 했는지 구체적으로 드러나야 합니다.
+summary는 공백과 문장부호를 포함해 **반드시 70~125자**로 작성합니다. 목표는 90~105자입니다.
+요약은 제목을 반복하지 말고 실제 원문에 나온 사실 2~3개를 자연스러운 2문장으로 연결합니다.
+사실이 부족할 때는 분량을 채우려고 관용구를 붙이지 말고, 같은 카테고리의 다른 후보를 사용하세요.
 ‘논의가 이어집니다’, ‘추가 발표를 확인해야 합니다’, ‘중요합니다’, ‘관심이 높습니다’처럼 새 사실이 없는 문장은 절대 금지합니다.
 출처명·신문사명·기사 날짜를 본문 아래에 쓰지 마세요. 헤드라인을 본문 첫머리에 다시 붙이지 마세요.
 정치·의료 정책에서 제안/검토/발표/확정/시행을 혼동하지 마세요. 신약은 연구/비임상/임상/허가/급여를 구분하세요.
-대상 기사 본문의 텍스트에서 **그대로 복사한 서로 다른 두 문장 조각**을 evidence 배열에 넣으세요. 각 조각은 최소 14자, 80자 이내로, 제목이 아닌 원문 본문에 존재해야 합니다.
+수치를 쓰려면 원문의 숫자 표기를 그대로 쓰고 새로운 수치·기간·일정을 만들어내지 마세요.
+evidence 배열에는 선택한 후보의 **본문에서 글자 그대로 복사한 별개 원문 조각 2개**를 넣으세요. 각 조각은 14~80자여야 합니다.
+각 조각은 인용 부호를 제외하고 본문에 그대로 존재해야 하며, 기사의 제목에서 가져오면 안 됩니다.
+응답 전 headline 길이와 summary 길이를 스스로 세고, summary가 70~125자가 아니면 고쳐서 제출하세요.
 반드시 {"items":[{"category":"...","candidate_id":"원문 후보 id","headline":"...","summary":"...","evidence":["원문 그대로 한 부분", "원문 그대로 다른 부분"]}]} JSON만 출력하세요.
 요청 카테고리: ''' + ', '.join(needed_categories)
+    if repair_notes:
+        instruction += ('\n이 요청은 1차 출력에서 검증되지 않은 분야의 **재작성**입니다. '
+                        '다음 사유를 반드시 해소하세요. 검증 기준을 줄이거나 원문에 없는 사실을 넣어서는 안 됩니다. '
+                        + json.dumps(repair_notes,ensure_ascii=False))
+    item_schema={
+      'type':'OBJECT',
+      'properties':{
+       'category':{'type':'STRING','enum':list(needed_categories)},
+       'candidate_id':{'type':'STRING'},
+       'headline':{'type':'STRING'},
+       'summary':{'type':'STRING'},
+       'evidence':{'type':'ARRAY','items':{'type':'STRING'}}
+      },
+      'required':['category','candidate_id','headline','summary','evidence']
+    }
+    output_schema={'type':'OBJECT', 'properties':{'items':{'type':'ARRAY','items':item_schema}},
+                   'required':['items']}
     url='https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent'
     response=requests.post(url,headers={'x-goog-api-key':key},json={
       'contents':[{'parts':[{'text':instruction+'\n자료(JSON): '+json.dumps(schemas,ensure_ascii=False)}]}],
-      'generationConfig':{'responseMimeType':'application/json','temperature':0.05, 'maxOutputTokens':5000}
+      'generationConfig':{'responseMimeType':'application/json','responseSchema':output_schema,
+                          'temperature':0.05, 'maxOutputTokens':5000}
     },timeout=95)
     response.raise_for_status()
     data=response.json()
@@ -306,39 +330,71 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
     for cat in intended:flat.extend(candidates.get(cat,[]))
     if len(flat)<(3 if medical else 5):
         raise PublicationQualityError('원문 전문을 읽을 수 있는 기사 후보가 부족합니다.')
-    try:res=_call_gemini(key,flat,intended)
-    except (requests.RequestException,ValueError,KeyError,IndexError,TypeError) as exc:
-        raise PublicationQualityError('AI 근거 기반 요약 실패: '+type(exc).__name__) from exc
-    if not isinstance(res,dict) or not isinstance(res.get('items'),list):
-        raise PublicationQualityError('AI가 검증 가능한 JSON 형식을 제공하지 않았습니다.')
     sources={a['candidate_id']:a for a in flat}
-    approved={}
-    rejected=[]
-    for item in res['items']:
-        if not isinstance(item,dict):continue
-        cat=item.get('category')
-        if cat not in intended or cat in approved:continue
-        s=sources.get(str(item.get('candidate_id','')))
-        if not s or s['category']!=cat:
-            rejected.append((cat,'출처 후보 ID 오류'));continue
-        ok,reason=validate_article(item,s)
-        if not ok:
-            rejected.append((cat,reason));continue
-        approved[cat]={
-           'category':cat,'title':s['title'],'headline':compact(item['headline']),
-           'summary':compact(item['summary']),'date':s['date'],
-           'source':s['source'],'url':s['url'],
-           'fact_proofs': [{'quote':compact(quote)[:80]} for quote in item['evidence'][:2]],
-           'fact_content_hash':hashlib.sha256(s['content'].encode()).hexdigest()[:16],
-        }
-    if not medical:
-        missing=[cat for cat in intended if cat not in approved]
-        if missing:
-            raise PublicationQualityError('아침뉴스 검증 미통과: '+', '.join(missing)+'. '+repr(rejected))
-    elif len(approved)<5:
-        raise PublicationQualityError('보험·의료 브리핑 5건 모두 검증 필요: '+repr(rejected))
-    result=[approved[cat] for cat in intended if cat in approved][:5]
-    # 다른 카테고리에서 같은 사건을 중복 선별한 경우에도 발행하지 않는다.
+    approved:dict[str,dict]={}
+    rejected:list[tuple[str,str]]=[]
+    reasons:dict[str,str]={}
+
+    def accept_result(res:dict,requested:tuple[str,...]):
+        if not isinstance(res,dict) or not isinstance(res.get('items'),list):
+            raise ValueError('AI가 검증 가능한 items JSON 배열을 제공하지 않았습니다.')
+        arrived=set()
+        for item in res['items']:
+            if not isinstance(item,dict):continue
+            cat=item.get('category')
+            if cat not in requested or cat in approved:continue
+            arrived.add(cat)
+            source=sources.get(str(item.get('candidate_id','')))
+            if not source or source['category']!=cat:
+                reason='선택 후보 ID가 입력 원문과 일치하지 않음'
+            else:
+                ok,reason=validate_article(item,source)
+                if ok:
+                    approved[cat]={
+                      'category':cat,'title':source['title'],
+                      'headline':compact(item['headline']),
+                      'summary':compact(item['summary']),'date':source['date'],
+                      'source':source['source'],'url':source['url'],
+                      'fact_proofs':[{'quote':compact(quote)[:80]} for quote in item['evidence'][:2]],
+                      'fact_content_hash':hashlib.sha256(source['content'].encode()).hexdigest()[:16],
+                    }
+                    reasons.pop(cat,None)
+                    print(f'[기사 검증 통과] {cat}: 제목과 원문 근거 확인')
+                    continue
+            reasons[cat]=reason
+            rejected.append((cat,reason))
+            print(f'[기사 검증 탈락] {cat}: {reason}')
+        for cat in requested:
+            if cat not in approved and cat not in arrived:
+                reason='AI가 해당 분야의 검증 가능한 기사를 반환하지 않음'
+                reasons[cat]=reason
+                rejected.append((cat,reason))
+
+    # 일괄 요청에서 이미 통과한 기사는 보존하고 탈락한 기사만 보충한다.
+    try:
+        accept_result(_call_gemini(key,flat,intended), intended)
+    except (requests.RequestException,ValueError,KeyError,IndexError,TypeError) as exc:
+        print('[일괄 편집 실패] '+type(exc).__name__+' — 분야별 재시도를 진행합니다.')
+
+    # 1차 출력의 길이/원문 근거/분야 누락만 별도 AI 요청으로 복구한다.
+    for cat in intended:
+        if cat in approved:continue
+        subset=candidates.get(cat,[])[:3]
+        if not subset:continue
+        why=reasons.get(cat,'출력 형식 또는 분야 누락')
+        try:
+            repaired=_call_gemini(key,subset,(cat,),repair_notes={cat:why})
+            accept_result(repaired,(cat,))
+        except (requests.RequestException,ValueError,KeyError,IndexError,TypeError) as exc:
+            rejected.append((cat,'분야별 재시도 실패: '+type(exc).__name__))
+            print('[기사 재시도 실패] '+cat+': '+type(exc).__name__)
+
+    missing=[cat for cat in intended if cat not in approved]
+    if missing:
+        report=[(cat,reasons.get(cat,'원문 검증 또는 AI 재시도 실패')) for cat in missing]
+        label='보험·의료 브리핑' if medical else '아침뉴스'
+        raise PublicationQualityError(label+' 검증 미통과(재시도 후): '+repr(report))
+    result=[approved[cat] for cat in intended]
     if has_duplicate_topics(result):
         raise PublicationQualityError('다른 분야에 사실상 동일한 사건이 중복됐습니다. 기사 재선정 필요')
     return result
