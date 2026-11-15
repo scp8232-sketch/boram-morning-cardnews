@@ -56,7 +56,7 @@ def test_novalid_article_pipeline_stops(monkeypatch):
     monkeypatch.setenv('GEMINI_API_KEY','fake-key')
     categories={k:[{'candidate_id':k, 'category':k,'url':'https://example.org/a','content':'근거'*200,
                     'title':'정책','date':'2026-11-13','source':'공식기관'}] for k in editorial.GENERAL_CATEGORIES}
-    monkeypatch.setattr(editorial,'_call_gemini',lambda key,items,cats:{'items':[]})
+    monkeypatch.setattr(editorial,'_call_gemini',lambda key,items,cats,repair_notes=None:{'items':[]})
     with pytest.raises(editorial.PublicationQualityError,match='검증 미통과'):
         editorial.write_verified_news(categories,medical=False)
 
@@ -125,7 +125,7 @@ def test_unverifiable_news_remains_blocked_after_one_retry(monkeypatch):
     monkeypatch.setattr(editorial,'_call_gemini',no_facts)
     with pytest.raises(editorial.PublicationQualityError,match='재시도 후'):
         editorial.write_verified_news(candidates)
-    assert len(attempts)==3  # 최초 일괄 1회 + 탈락 분야 묶음 재시도 최대 2회
+    assert len(attempts)==6  # 1회 일괄 + 누락된 5개 분야를 각 1회 단독 검증
 
 
 def test_passage_ids_grounded_in_actual_article():
@@ -262,8 +262,8 @@ def test_missing_categories_repaired_together(monkeypatch):
     monkeypatch.setattr(editorial,'_call_gemini',mock_call)
     monkeypatch.setattr(editorial,'has_duplicate_topics',lambda items:False)
     assert len(editorial.write_verified_news(categories))==5
-    assert len(calls)==2
-    assert len(calls[1])==4
+    assert len(calls)==5
+    assert calls[1:] == [("경제",), ("사회",), ("국제",), ("생활/문화",)]
 
 
 def test_gemini_retry_503_then_success(monkeypatch):
@@ -305,3 +305,50 @@ def test_429_daily_quota_is_not_retried(monkeypatch):
         editorial._call_gemini('secret',[],('사회',))
     assert exc.value.retryable is False
     assert len(calls)==1
+
+
+def test_omitted_categories_are_retried_individually(monkeypatch):
+    """Regression: politics/culture omission is not retried as same batch."""
+    monkeypatch.setenv('GEMINI_API_KEY','test-key')
+    details=(
+        '담당 기관은 해당 분야의 새로운 제도에 관하여 공식적인 설명회를 개최했다고 발표했다. '
+        '설명회에서는 지역 현장 접수와 온라인 안내 서비스의 운영을 구분하여 공개했다. '
+        '관계자는 두 가지 이용 절차를 정리해 신청 대상자에게 별도로 안내했다. '
+    )
+    cats=editorial.GENERAL_CATEGORIES
+    candidates={cat:[{'candidate_id':cat,'category':cat,'title':cat+' 새로운 제도 운영 안내',
+       'date':'2026-11-15','url':'https://example.org/a/'+str(i),
+       'source':'기관 발표','content':details}] for i,cat in enumerate(cats)}
+    example_summary=('담당 기관은 새로운 제도를 소개하고 지역 현장 접수와 온라인 서비스의 운영 방법을 나누어 공개했습니다. '
+       '참석자는 두 가지 안내 절차를 확인해 신청 대상자에게 추가 설명을 제공했습니다.')
+    assert 70<=len(example_summary)<=125
+    def make(cat):
+        return {'category':cat,'candidate_id':cat,
+            'headline':cat+' 분야의 새로운 제도에 관한 공식 설명회 개최',
+            'summary':example_summary,'evidence_ids':['E01','E02']}
+    seen=[]
+    def fake(key,rows,requested,repair_notes=None):
+        seen.append(requested)
+        if len(requested)>1:
+            return {'items':[make(cat) for cat in requested if cat not in ('정치','생활/문화')]}
+        return {'items':[make(requested[0])]}
+    monkeypatch.setattr(editorial,'_call_gemini',fake)
+    monkeypatch.setattr(editorial,'has_duplicate_topics',lambda arr:False)
+    result=editorial.write_verified_news(candidates)
+    assert len(result)==5
+    assert seen==[cats,('정치',),('생활/문화',)]
+
+
+def test_empty_source_category_has_diagnostic_not_fake_filler(monkeypatch):
+    monkeypatch.setenv('GEMINI_API_KEY','test-key')
+    details=('담당 기관은 새로운 지역 서비스를 시행한다고 공식적으로 발표했다. '
+        '시민은 온라인에서도 서비스를 신청할 수 있게 됐다고 밝혔다. '
+        '지역별 신청 절차가 서로 다르다는 점도 설명했다. ')
+    cats=editorial.GENERAL_CATEGORIES
+    candidates={cat:[{'candidate_id':cat,'category':cat,'title':'공식 안내',
+              'date':'2026-11-15','url':'https://example.org/a',
+              'source':'기관 발표','content':details}] for cat in cats[1:]}
+    candidates[cats[0]]=[]
+    monkeypatch.setattr(editorial,'_call_gemini',lambda *a,**kw:{'items':[]})
+    with pytest.raises(editorial.PublicationQualityError,match='원문 전문과 사실 근거가 확인된 기사 후보가 없음'):
+        editorial.write_verified_news(candidates)

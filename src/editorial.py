@@ -30,11 +30,11 @@ MEDICAL_CATEGORIES = ('건강보험','보험제도','보건정책','의료기술
 
 # RSS 피드 링크는 매체가 공개한 경로만 사용. 피드 실패 시 Google 뉴스 RSS로 보완.
 FEEDS = {
- '정치': ['https://www.newsis.com/RSS/politics.xml','https://www.yna.co.kr/rss/politics.xml'],
+ '정치': ['https://www.newsis.com/RSS/politics.xml','https://www.yna.co.kr/rss/politics.xml','https://www.khan.co.kr/rss/rssdata/politic_news.xml'],
  '경제': ['https://www.newsis.com/RSS/economy.xml','https://www.yna.co.kr/rss/economy.xml'],
  '사회': ['https://www.mois.go.kr/gpms/view/jsp/rss/rss.jsp?ctxCd=1012','https://www.newsis.com/RSS/society.xml','https://www.yna.co.kr/rss/news.xml'],
  '국제': ['https://www.newsis.com/RSS/international.xml','https://www.yna.co.kr/rss/international.xml'],
- '생활/문화': ['https://www.newsis.com/RSS/culture.xml','https://www.yna.co.kr/rss/culture.xml'],
+ '생활/문화': ['https://www.newsis.com/RSS/culture.xml','https://www.yna.co.kr/rss/culture.xml','https://www.khan.co.kr/rss/rssdata/culture_news.xml'],
  '건강보험': ['https://www.yna.co.kr/rss/health.xml','https://www.newsis.com/RSS/health.xml'],
  '보험제도': ['https://www.newsis.com/RSS/bank.xml','https://www.yna.co.kr/rss/economy.xml'],
  '보건정책': ['https://www.newsis.com/RSS/health.xml','https://www.yna.co.kr/rss/health.xml'],
@@ -356,6 +356,9 @@ def collect_candidates(categories: tuple[str,...], *, today: date | None=None,
             if len(enriched)>=max_per_category+2:break
         enriched.sort(key=lambda x:candidate_score(x,today),reverse=True)
         out[category]=enriched[:max_per_category]
+        # Show why a category is missing before Gemini is called. Never log article
+        # full text or secret values; counts are sufficient for diagnosis.
+        print(f'[원문 수집] {category}: RSS/검색 {len(rows)}건, 날짜·제목 필터 {len(plausible)}건, 본문 검증 후보 {len(out[category])}건',flush=True)
         seen_urls.update(x['url'] for x in out[category])
     return out
 
@@ -479,8 +482,8 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
     intended=tuple(MEDICAL_CATEGORIES if medical else GENERAL_CATEGORIES)
     flat=[]
     for cat in intended:flat.extend(candidates.get(cat,[]))
-    if len(flat)<(3 if medical else 5):
-        raise PublicationQualityError('원문 전문을 읽을 수 있는 기사 후보가 부족합니다.')
+    if not flat:
+        raise PublicationQualityError('원문 전문을 읽을 수 있는 기사 후보가 없습니다.')
     sources={a['candidate_id']:a for a in flat}
     approved:dict[str,dict]={}
     rejected:list[tuple[str,str]]=[]
@@ -522,34 +525,52 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
                 reasons[cat]=reason
                 rejected.append((cat,reason))
 
-    # First request checks all categories. Recheck *only missing categories* in
-    # grouped batches, rather than 5 rapid individual calls that can hit free
-    # API request rate limits. Previously approved facts are never rewritten.
     handled_errors = (requests.RequestException, GeminiApiRequestError,
                       ValueError, KeyError, IndexError, TypeError)
     def error_name(exc):
         return str(exc) if isinstance(exc,GeminiApiRequestError) else type(exc).__name__
 
-    try:
-        accept_result(_call_gemini(key,flat,intended), intended)
-    except handled_errors as exc:
-        print('[일괄 편집 실패] '+error_name(exc)+' — 묶음 재시도로 전환')
-        if isinstance(exc,GeminiApiRequestError) and not exc.retryable:
-            raise PublicationQualityError('Gemini API 호출 실패: '+error_name(exc)) from None
-
-    for attempt in range(2):
-        pending=tuple(cat for cat in intended if cat not in approved and candidates.get(cat))
-        if not pending:
-            break
-        subset=[a for cat in pending for a in candidates[cat][:3]]
-        repair_notes={cat:reasons.get(cat,'분야 누락 또는 검증 불충분: 다른 후보 또는 원문 근거로 재작성')
-                      for cat in pending}
+    # Initial pass: one complete article per category is easier to follow than
+    # an enormous 15-article prompt. Keep other candidates for later repairs.
+    print('[AI 검증] 1차 분야별 원문 후보: '+', '.join(f'{cat}={len(candidates.get(cat,[]))}' for cat in intended),flush=True)
+    initial=[candidates[cat][0] for cat in intended if candidates.get(cat)]
+    initial_categories=tuple(cat for cat in intended if candidates.get(cat))
+    if initial:
         try:
-            accept_result(_call_gemini(key,subset,pending,repair_notes=repair_notes),pending)
+            accept_result(_call_gemini(key,initial,initial_categories),initial_categories)
         except handled_errors as exc:
-            print('[묶음 재시도 오류] '+error_name(exc)+' — 남은 분야: '+', '.join(pending))
+            print('[일괄 편집 실패] '+error_name(exc)+' — 분야별 재작성 진행',flush=True)
             if isinstance(exc,GeminiApiRequestError) and not exc.retryable:
-                break
+                raise PublicationQualityError('Gemini API 호출 실패: '+error_name(exc)) from None
+
+    # If the model omits one category in a batch, reissuing the SAME batch
+    # does not solve anything. Retry only the missing category with an explicit
+    # single-category request and alternate *real* article candidates.
+    # Never generate an unsourced replacement or weaken quality checks.
+    for cat in intended:
+        if cat in approved: continue
+        options=candidates.get(cat,[])
+        if not options:
+            reasons[cat]='원문 전문과 사실 근거가 확인된 기사 후보가 없음'
+            print(f'[분야별 재시도 불가] {cat}: 검증 가능한 원문 후보 0건',flush=True)
+            continue
+        for attempt, candidate in enumerate(options[:3],1):
+            if cat in approved:break
+            note=reasons.get(cat,'일괄 요청에서 분야 누락')
+            # Give the model all and only the facts of this one article;
+            # explicit output is still verified with actual downloaded text.
+            request_note={cat:(f'{note}. 반드시 {cat} 분야 1건을 검토하여 '
+                '원문 근거 2개가 있으면 정확히 1건만 반환하세요. '
+                '근거가 없으면 빈 목록을 반환하세요. 다른 분야 기사는 선택하지 마세요.')}
+            print(f'[분야별 단독 재검증] {cat}: 후보 {attempt}/{min(3,len(options))}',flush=True)
+            try:
+                accept_result(_call_gemini(key,[candidate],(cat,),repair_notes=request_note),(cat,))
+            except handled_errors as exc:
+                print(f'[분야별 재시도 오류] {cat}: '+error_name(exc),flush=True)
+                if isinstance(exc,GeminiApiRequestError) and not exc.retryable:
+                    raise PublicationQualityError('Gemini API 호출 실패: '+error_name(exc)) from None
+        if cat not in approved and cat not in reasons:
+            reasons[cat]='확인된 원문 후보가 있지만 AI가 근거를 검증하지 못함'
 
     missing=[cat for cat in intended if cat not in approved]
     if missing:
