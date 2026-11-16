@@ -1,0 +1,39 @@
+name: 카카오톡 수신 진단 (수동 문자 1건)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: morning-cardnews
+  cancel-in-progress: false
+
+jobs:
+  kakao-diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 안전 진단 도구 의존성 설치
+        run: pip install requests cryptography
+      - name: 카카오 인증 계정 확인 및 짧은 수신 문자 1건 테스트
+        env:
+          KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
+          KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+        run: python -m src.kakao_delivery_test
+      - name: 암호화된 갱신 토큰 저장
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/kakao_refresh.enc 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "security: persist encrypted Kakao token after diagnostic"
+            git push
+          fi
