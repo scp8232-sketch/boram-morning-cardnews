@@ -3,8 +3,14 @@
     "medical",
     "morning"
   ],
-  "2026-11-16": [
-    "medical",
-    "morning"
-  ]
+  "2026-11-16": {
+    "legacy": [
+      "medical",
+      "morning"
+    ],
+    "manual-43881459918": [
+      "medical",
+      "morning"
+    ]
+  }
 }
