@@ -256,11 +256,14 @@ def evidence_catalog(fulltext: str, *, max_passages: int = 32) -> dict[str, str]
         sentence = sentence.strip()
         if len(normalize(sentence)) < 22:
             continue
-        # Long editorial paragraphs can contain several facts. Split at a word
-        # boundary; each piece remains an unmodified substring of the article.
-        while len(sentence) > 210:
-            i = sentence.rfind(' ', 105, 190)
-            if i < 105: i = 180
+        # Preserve complete, long Korean news sentences for grounded AI repairs.
+        # Splitting a 250-500 character factual sentence at an arbitrary space
+        # produces fragments that cannot pass the complete-sentence fallback.
+        # Only exceptionally long passages need splitting, and split pieces
+        # remain literal substrings of the original article.
+        while len(sentence) > 500:
+            i = sentence.rfind(' ', 240, 450)
+            if i < 240: i = 420
             segment = sentence[:i].strip()
             if len(normalize(segment)) >= 22:
                 pieces.append(segment)
@@ -424,7 +427,7 @@ def _fetch_verified_entries(items: list[dict], category: str, seen_urls: set[str
 
 
 def collect_candidates(categories: tuple[str,...], *, today: date | None=None,
-                       max_per_category: int=3) -> dict[str,list[dict]]:
+                       max_per_category: int=5) -> dict[str,list[dict]]:
     today = today or datetime.now(KST).date()
     out = {}
     seen_urls: set[str] = set()
@@ -748,7 +751,7 @@ def _best_full_fact_pair(article: dict) -> tuple[str, str, str, str] | None:
             '기사제공','저작권','이용약관') + BANNED_FILLER
     for i,(eid,text) in enumerate(catalog.items()):
         t=compact(text)
-        if not (27 <= len(t) <= 210) or not t.endswith(('.', '!', '?', '。')):
+        if not (27 <= len(t) <= 500) or not t.endswith(('.', '!', '?', '。')):
             continue
         if any(b.lower() in t.lower() for b in junk):
             continue
@@ -760,7 +763,10 @@ def _best_full_fact_pair(article: dict) -> tuple[str, str, str, str] | None:
                                   '지원','접수','열었','논의','검토','추진',
                                   '전시','공연','개막','폐막','기획','참여',
                                   '지난','확인','증가','감소','열렸'))
-        if not (event or grounded or overlap >= 2):
+        # A complete, attributed sentence can report a real political fact
+        # without using a verb from the small keyword list.
+        attributed = bool(re.search(r'(?:했다|됐다|이다|있다|없다|한다|된다|밝혔다|전했다|설명했다)[.!?。]$', t))
+        if not (event or grounded or overlap >= 2 or (overlap >= 1 and attributed)):
             continue
         facts.append((4*overlap+3*grounded+2*event-i*.08,eid,t))
     if len(facts) < 2:
@@ -949,7 +955,7 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
             reasons[cat]='원문 전문과 사실 근거가 확인된 기사 후보가 없음'
             print(f'[분야별 재시도 불가] {cat}: 검증 가능한 원문 후보 0건',flush=True)
             continue
-        for attempt, candidate in enumerate(options[:3],1):
+        for attempt, candidate in enumerate(options[:5],1):
             if cat in approved:break
             note=reasons.get(cat,'일괄 요청에서 분야 누락')
             # Give the model all and only the facts of this one article;
@@ -957,7 +963,7 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
             request_note={cat:(f'{note}. 반드시 {cat} 분야 1건을 검토하여 '
                 '원문 근거 2개가 있으면 정확히 1건만 반환하세요. '
                 '근거가 없으면 빈 목록을 반환하세요. 다른 분야 기사는 선택하지 마세요.')}
-            print(f'[분야별 단독 재검증] {cat}: 후보 {attempt}/{min(3,len(options))}',flush=True)
+            print(f'[분야별 단독 재검증] {cat}: 후보 {attempt}/{min(5,len(options))}',flush=True)
             try:
                 accept_result(_call_gemini(key,[candidate],(cat,),repair_notes=request_note),(cat,))
             except handled_errors as exc:
@@ -973,7 +979,7 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
     for cat in intended:
         if cat in approved:
             continue
-        for candidate in candidates.get(cat, [])[:3]:
+        for candidate in candidates.get(cat, [])[:5]:
             fallback = _safe_extractive_fallback(candidate)
             if fallback is None:
                 continue
@@ -1001,12 +1007,14 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
     # Output still passes the normal source/number/title checks.
     for cat in intended:
         if cat in approved: continue
-        for candidate in candidates.get(cat,[])[:2]:
+        for candidate in candidates.get(cat,[])[:5]:
             try:
                 fixed=_narrow_ai_repair(key,candidate)
             except PublicationQualityError:
                 raise
-            if fixed is None: continue
+            if fixed is None:
+                print(f'[근거 2문장 재작성 불가] {cat}: 후보의 완결 사실 근거 부족 또는 재작성 검증 탈락', flush=True)
+                continue
             proofs,_=_verified_evidence(fixed,candidate['content'])
             approved[cat]={
                 'category':cat, 'title':candidate['title'],
