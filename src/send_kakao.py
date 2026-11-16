@@ -119,13 +119,30 @@ def main():
     base = os.environ.get('PAGES_BASE_URL', '').strip()
     if not base.startswith('https://'):
         raise RuntimeError('GitHub Pages 배포 주소를 먼저 설정해야 합니다.')
-    # 신규 중복 실행시 이미 보낸 카드 재발송 방지
+    # 수동 시험 발송과 정기 예약 발송은 서로 독립적으로 기록한다.
+    # 기존 v12 기록은 날짜별 배열이었다. 대부분 수동 테스트에서 생긴 이 기록은
+    # 예약 발송을 차단해서는 안 된다(예: 새벽 00:47 시험 후 06:13 예약 실행).
     sent = json.loads(SENT_FILE.read_text(encoding='utf-8')) if SENT_FILE.exists() else {}
-    if sent.get(date) == ['morning', 'medical']:
-        print('오늘은 이미 두 장을 발송했습니다. 중복 발송을 생략합니다.')
+    old_record = sent.get(date, {})
+    if isinstance(old_record, list):
+        day_record = {'legacy': sorted(set(old_record))}
+        print('이전 형식 발송 기록을 보존합니다. 예약 발송을 차단하지 않습니다.')
+    elif isinstance(old_record, dict):
+        day_record = old_record
+    else:
+        raise RuntimeError('기존 발송 기록 형식이 올바르지 않습니다. 기록을 덮어쓰지 않습니다.')
+
+    event = os.environ.get('GITHUB_EVENT_NAME', '').strip()
+    run_id = os.environ.get('GITHUB_RUN_ID', 'local').strip() or 'local'
+    # GitHub 예약 실행은 하루 1회만, 수동 실행은 사용자가 누른 각 실행마다 1회만.
+    # 한밤중에 수동 발송했어도 그날 아침 예약 발송은 반드시 다시 시도한다.
+    delivery_id = 'schedule' if event == 'schedule' else 'manual-' + run_id
+    completed = set(day_record.get(delivery_id, []))
+    if completed == {'morning', 'medical'}:
+        print(f'이미 완료한 발송입니다({date}, {delivery_id}). 재발송을 생략합니다.')
         return
+    print(f'발송 종류: {"예약" if event == "schedule" else "수동"} / 발행일: {date} / 실행: {delivery_id}')
     token = refreshed_access_token()
-    completed = set(sent.get(date, []))
     for key, title in [('morning', '이보람의 MORNING POST'), ('medical', '보험·의료 브리핑')]:
         if key in completed:
             continue
@@ -134,10 +151,11 @@ def main():
         wait_page(preview_url)
         send_one(token, title, preview_url, original_url, date)
         completed.add(key)
-        sent[date] = sorted(completed)
+        day_record[delivery_id] = sorted(completed)
+        sent[date] = day_record
         SENT_FILE.parent.mkdir(parents=True, exist_ok=True)
         SENT_FILE.write_text(json.dumps(sent, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
-        print(title + ' 발송 API 성공')
+        print(f'{title} 발송 API 성공 ({delivery_id})')
     print('카카오 API 발송 완료. 실제 카카오톡 수신은 본인 채팅에서 확인하세요.')
 
 

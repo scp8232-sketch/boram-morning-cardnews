@@ -2,8 +2,8 @@ name: 이보람의 평일 아침 카드뉴스
 
 on:
   schedule:
-    # 한국시간 월~금 05:34. GitHub cron은 UTC 기준이며 실행 지연 가능.
-    - cron: '34 20 * * 0-4'
+    # 한국시간 월~금 05:10 (UTC 전날 20:10). 오전 06:30 전 수신을 위한 여유 확보; GitHub 지연 가능.
+    - cron: '10 20 * * 0-4'
   workflow_dispatch:
 
 permissions:
