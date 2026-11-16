@@ -12,7 +12,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: morning-cardnews
+  group: morning-cardnews-recovery-20261117
   cancel-in-progress: false
 
 jobs:
