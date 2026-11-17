@@ -67,3 +67,56 @@ def test_rss_time_before_cutoff_is_accepted(monkeypatch):
         {**rows[0], 'category':cat,'content':'학교 안전 점검 제도 개선을 발표했다. '*25,'candidate_id':'x'}] if rows else [])
     result=editorial.collect_candidates(('사회',),today=as_of.date(),as_of=as_of)
     assert len(result['사회'])==1
+
+
+def test_suneung_ai_story_across_politics_and_society_is_same_event():
+    a={'category':'정치','title':'여야, 수능 AI 부정행위 처벌강화 법안 발의',
+       'headline':'수능 인공지능 부정행위 처벌 강화'}
+    b={'category':'사회','title':'대통령 수능 비상점검 회의 부정행위 근절 강조',
+       'headline':'수능 AI 부정행위 전수조사 지시'}
+    assert editorial.same_news_event(a,b)
+    assert editorial.has_duplicate_topics([a,b])
+
+
+def test_different_education_stories_do_not_trigger_event_match():
+    a={'category':'정치','title':'수능 AI 부정행위 법안 발의'}
+    b={'category':'사회','title':'초등학교 돌봄교실 신청 확대'}
+    assert not editorial.same_news_event(a,b)
+
+
+def test_life_events_fall_behind_consumer_advice():
+    event=row('서울문화재단 AI 예술교육 포럼 개최','생활/문화')
+    daily=row('겨울철 난방비 환급 신청 기간 안내','생활/문화')
+    assert editorial.editorial_priority(daily)>editorial.editorial_priority(event)
+
+
+def test_duplicate_politics_society_replaced_with_second_society_candidate(monkeypatch):
+    """End-to-end offline selection: same exam story cannot occupy two categories."""
+    monkeypatch.setenv('GEMINI_API_KEY', 'test')
+    categories = {}
+    names = {
+        '정치': '여야, 수능 AI 부정행위 처벌 강화 법안 발의',
+        '경제': '코스피 지수 변동과 외환시장 동향 발표',
+        '사회': '수능 인공지능 부정행위 전수조사 지시',
+        '국제': '국제 해상물류 공급망 대응 정상 협력',
+        '생활/문화': '버스 요금 환급 신청 제도 개선 안내',
+    }
+    for cat in editorial.GENERAL_CATEGORIES:
+        categories[cat]=[{'category':cat, 'candidate_id':cat+'-0',
+             'title':names[cat], 'url':'https://example.org/'+cat+'-0',
+             'date':'2026-11-17','source':'test', 'content':'사실 근거를 확인하기 위한 독립된 내용입니다. '*30}]
+    categories['사회'].append({'category':'사회', 'candidate_id':'사회-1',
+        'title':'도로 안전시설 전면 점검 후 결과 발표',
+        'url':'https://example.org/society-other', 'date':'2026-11-17',
+        'source':'test','content':'서로 다른 도로 안전 기사 본문입니다. '*30})
+    monkeypatch.setattr(editorial,'validate_article',lambda draft,src:(True,''))
+    monkeypatch.setattr(editorial,'_verified_evidence',lambda draft,content:(['확인된 근거 1','확인된 근거 2'],''))
+    def model(key, sources, requested,repair_notes=None):
+        return {'items':[{'category':source['category'], 'candidate_id':source['candidate_id'],
+              'headline':source['title'],'summary':'제목과 겹치지 않는 핵심 추가 사실을 상세히 확인했습니다.',
+              'evidence_ids':['E01','E02']} for source in sources]}
+    monkeypatch.setattr(editorial,'_call_gemini',model)
+    result=editorial.write_verified_news(categories)
+    assert len(result)==5
+    assert result[2]['title']=='도로 안전시설 전면 점검 후 결과 발표'
+    assert not editorial.has_duplicate_topics(result)

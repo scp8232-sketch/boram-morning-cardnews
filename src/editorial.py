@@ -81,7 +81,7 @@ ECON_OTHER_MARKETS = ('대만 증시', '대만 주식', '타이베이 증시', '
 LIFE_USEFUL = ('교통', '지하철', '버스', '요금', '환급', '지원금', '소비자', '피해',
                '주거', '전세', '월세', '주택', '교육', '학교', '안전', '화재',
                '식품', '식중독', '예방접종', '신청', '생활비', '난방비', '통신비')
-LIFE_EVENTS = ('전시', '공연', '축제', '미술관', '음악회', '언론공개회', '개막')
+LIFE_EVENTS = ('전시', '공연', '축제', '미술관', '음악회', '언론공개회', '개막', '포럼', '세미나', '심포지엄')
 TOPIC_STOPWORDS = {'오늘','어제','내일','정부','한국','국내','사회','경제','정치','국제',
                    '관련','분야','소식','종합','속보','논란','발표','추진','문제',
                    '기자','뉴시스','연합뉴스','공개','확인','완료','새로운','내용',
@@ -118,7 +118,7 @@ def editorial_priority(a: dict) -> float:
         else: value+=9
     elif category=='생활/문화':
         if any(x in title for x in LIFE_USEFUL): value+=60
-        if any(x in title for x in LIFE_EVENTS): value-=22
+        if any(x in title for x in LIFE_EVENTS): value-=55
     elif category=='정치':
         if any(x in title for x in ('합의','의결','통과','시행','국회','법안','안보','협력','대책','후속')):
             value+=19
@@ -654,7 +654,7 @@ summary는 공백과 문장부호를 포함해 기본 70~110자로 작성하되,
 헤드라인에서 핵심 결과를 전달하고 요약은 제목에 없는 배경·조치·수치·영향 등 새로운 사실을 전달합니다. 이미 제목에 담긴 사건 설명을 되풀이하지 마세요. 내용이 충분하면 자연스러운 1~2문장으로 편집하세요.
 사실이 부족할 때는 분량을 채우려고 관용구를 붙이지 말고, 같은 카테고리의 다른 후보를 사용하세요.
 ‘논의가 이어집니다’, ‘추가 발표를 확인해야 합니다’, ‘중요합니다’, ‘관심이 높습니다’처럼 새 사실이 없는 문장은 절대 금지합니다.
-맞춤법, 조사, 문장 호응을 검토하고 동일 명사의 불필요한 반복을 줄이세요. 고유명사·전시명·정책명은 원문 표기를 보존하고 작품·전시 제목에는 따옴표를 사용하세요. 모든 문장은 '~습니다'체로 마무리하세요. 출처명·신문사명·기사 날짜를 본문 아래에 쓰지 마세요. 헤드라인을 본문 첫머리에 다시 붙이지 마세요.
+맞춤법, 조사, 문장 호응을 검토하고 동일 명사의 불필요한 반복을 줄이세요. 고유명사·전시명·정책명은 원문 표기를 보존하고 작품·전시 제목에는 따옴표를 사용하세요. 본문의 서술 문장은 '~습니다'체로 마무리하세요. 제목은 자연스러운 명사형을 권장합니다. 기사 제목과 본문이 같은 뜻을 반복하는 경우 새로운 사실로 교체하세요. 전시·포럼 안내는 국민 생활에 직접적인 효용이 없으면 생활/문화 분야의 다른 기사를 우선하세요. 출처명·신문사명·기사 날짜를 본문 아래에 쓰지 마세요. 헤드라인을 본문 첫머리에 다시 붙이지 마세요.
 정치·의료 정책에서 제안/검토/발표/확정/시행을 혼동하지 마세요. 신약은 연구/비임상/임상/허가/급여를 구분하세요.
 수치를 쓰려면 원문의 숫자 표기를 그대로 쓰고 새로운 수치·기간·일정을 만들어내지 마세요.
 원문 전체를 그대로 붙여 넣지 않고 관련 근거 문장만 압축해 evidence_catalog에 제시했습니다. 이 자료는 기사 원문에서 그대로 추출한 사실입니다.
@@ -998,6 +998,10 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
                 reason='선택 후보 ID가 입력 원문과 일치하지 않음'
             else:
                 ok,reason=validate_article(item,source)
+                if ok and not medical and any(same_news_event(
+                        {'title':source['title'],'headline':item.get('headline',''),'url':source['url']},
+                        selected) for selected in approved.values()):
+                    ok,reason=False,'이미 다른 분야에 선정된 동일 사건: 다른 기사 필요'
                 if ok:
                     approved[cat]={
                       'category':cat,'title':source['title'],
@@ -1073,8 +1077,14 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
         if cat in approved:
             continue
         for candidate in candidates.get(cat, [])[:5]:
+            if not medical and any(same_news_event(candidate, other) for other in approved.values()):
+                continue
             fallback = _safe_extractive_fallback(candidate)
             if fallback is None:
+                continue
+            if not medical and any(same_news_event(
+                    {'title':candidate['title'],'headline':fallback['headline'],'url':candidate['url']},
+                    other) for other in approved.values()):
                 continue
             evidence, _ = _verified_evidence(fallback, candidate['content'])
             approved[cat] = {
@@ -1101,12 +1111,18 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
     for cat in intended:
         if cat in approved: continue
         for candidate in candidates.get(cat,[])[:5]:
+            if not medical and any(same_news_event(candidate,other) for other in approved.values()):
+                continue
             try:
                 fixed=_narrow_ai_repair(key,candidate)
             except PublicationQualityError:
                 raise
             if fixed is None:
                 print(f'[근거 2문장 재작성 불가] {cat}: 후보의 완결 사실 근거 부족 또는 재작성 검증 탈락', flush=True)
+                continue
+            if not medical and any(same_news_event(
+                    {'title':candidate['title'],'headline':fixed['headline'],'url':candidate['url']},
+                    other) for other in approved.values()):
                 continue
             proofs,_=_verified_evidence(fixed,candidate['content'])
             approved[cat]={
@@ -1132,19 +1148,47 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
     return result
 
 
-def has_duplicate_topics(articles: list[dict]) -> bool:
+def _topic_family(item: dict) -> str:
+    """High-confidence same-event families; avoid mere overlap in generic news words.
+
+    Titles are publisher headlines and model headlines (not unrelated body/sidebar
+    text). If the evidence is ambiguous, the ordinary overlap check applies.
+    """
+    title=normalize(str(item.get('title',''))+' '+str(item.get('headline','')))
+    if '수능' in title and any(x in title for x in ('부정행위','ai','인공지능','스마트안경')):
+        return '수능-ai-부정행위'
+    if '전세사기' in title:
+        return '전세사기'
+    if '의대정원' in title or ('의과대학' in title and '정원' in title):
+        return '의대정원'
+    if '한일정상회담' in title or ('한일' in title and '정상회담' in title):
+        return '한일정상회담'
+    return ''
+
+
+def same_news_event(a: dict, b: dict) -> bool:
+    """Prevent the same story taking two slots without conflating whole beats."""
+    if a.get('url') and b.get('url') and a['url']==b['url']:
+        return True
+    family_a, family_b=_topic_family(a),_topic_family(b)
+    if family_a and family_a==family_b:
+        return True
     stop={'한국','정부','발표','진행','대책','지원','보도','관련','국민','강화','이날',
-          '논의','추진','개최','새로운','확대','예정','정책','주요','오늘','사실'}
-    titles=[]
-    for item in articles:
-        words=set(re.findall(r'[가-힣A-Za-z]{2,}', item.get('headline','')+' '+item.get('title','')))
-        titles.append({x for x in words if x not in stop})
-    for a in range(len(titles)):
-        for b in range(a+1,len(titles)):
-            left,right=titles[a],titles[b]
-            if left and right and len(left & right) >= 3 and len(left & right)/min(len(left),len(right)) >= .7:
-                return True
-    return False
+          '논의','추진','개최','새로운','확대','예정','정책','주요','오늘','사실',
+          '분야','행정','조치','안내','담당','기관','기자','지적','설명','확인'}
+    def terms(item):
+        # Use source article titles, not shared boilerplate in AI-written headlines.
+        text=str(item.get('title') or item.get('headline') or '')
+        return {x.lower() for x in re.findall(r'[가-힣A-Za-z]{3,}',text)
+                if x.lower() not in stop}
+    left,right=terms(a),terms(b)
+    return bool(left and right and len(left & right)>=3
+                and len(left & right)/min(len(left),len(right))>=.75)
+
+
+def has_duplicate_topics(articles: list[dict]) -> bool:
+    return any(same_news_event(a,b) for i,a in enumerate(articles)
+               for b in articles[i+1:])
 
 
 def build_news() -> tuple[list[dict],list[dict]]:

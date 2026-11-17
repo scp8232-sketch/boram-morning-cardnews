@@ -245,7 +245,7 @@ def test_missing_categories_repaired_together(monkeypatch):
              '관계자는 지역 거점에서 관련 서류를 접수하며 현장 안내를 제공한다고 밝혔습니다. '
              '접수 과정의 혼선을 줄이기 위해 공식 안내를 함께 게시했다고 설명했습니다. ')
     categories={cat:[{'category':cat,'candidate_id':cat,'content':content,
-                     'title':cat+' 정책 공지','date':'2026-11-15','source':'공식','url':'https://example.com/x'}]
+                     'title':cat+' 정책 공지','date':'2026-11-15','source':'공식','url':'https://example.com/'+cat}]
                 for cat in editorial.GENERAL_CATEGORIES}
     summary=('관계 기관은 지역 보건소의 새 신청 창구를 운영하고 현장 안내를 제공한다고 발표했습니다. '
              '서류 접수 과정의 혼선을 줄이기 위해 공식 안내도 함께 게시했다고 설명했습니다.')
@@ -444,6 +444,9 @@ def test_fallback_never_uses_unverified_or_repeated_generic_prose():
 
 
 def test_missing_ai_article_can_use_verified_source_without_fabrication(monkeypatch):
+    # This synthetic fixture reuses a single factual event across categories to
+    # isolate extractive fallback; production event de-duplication is tested separately.
+    monkeypatch.setattr(editorial,'same_news_event',lambda a,b:False)
     monkeypatch.setenv('GEMINI_API_KEY','fake-test-key')
     monkeypatch.setattr(editorial,'_call_gemini',lambda key, rows, cats, repair_notes=None: {'items':[]})
     original=_long_factual_source()
