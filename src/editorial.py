@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time as dt_time
 from email.utils import parsedate_to_datetime
 from html import unescape
 import hashlib
@@ -35,7 +35,8 @@ FEEDS = {
  '경제': ['https://www.newsis.com/RSS/economy.xml','https://www.yna.co.kr/rss/economy.xml'],
  '사회': ['https://www.mois.go.kr/gpms/view/jsp/rss/rss.jsp?ctxCd=1012','https://www.newsis.com/RSS/society.xml','https://www.yna.co.kr/rss/news.xml'],
  '국제': ['https://www.newsis.com/RSS/international.xml','https://www.yna.co.kr/rss/international.xml'],
- '생활/문화': ['https://www.newsis.com/RSS/culture.xml','https://www.yna.co.kr/rss/culture.xml','https://www.khan.co.kr/rss/rssdata/culture_news.xml'],
+ '생활/문화': ['https://www.newsis.com/RSS/culture.xml','https://www.yna.co.kr/rss/culture.xml','https://www.khan.co.kr/rss/rssdata/culture_news.xml',
+               'https://www.newsis.com/RSS/society.xml','https://www.newsis.com/RSS/economy.xml'],
  '건강보험': ['https://www.newsis.com/RSS/society.xml','https://www.yna.co.kr/rss/news.xml','https://www.newsis.com/RSS/bank.xml','https://www.newsis.com/RSS/health.xml'],
  '보험제도': ['https://www.newsis.com/RSS/bank.xml','https://www.newsis.com/RSS/economy.xml','https://www.yna.co.kr/rss/economy.xml','https://www.newsis.com/RSS/society.xml'],
  '보건정책': ['https://www.newsis.com/RSS/health.xml','https://www.yna.co.kr/rss/health.xml'],
@@ -54,7 +55,7 @@ NEWS_QUERIES = {
  '경제':'금융위원회 경제 산업 기업 시장 when:3d',
  '사회':'사회 교육 안전 재난 제도 when:3d',
  '국제':'국제 정상회의 외교 무역 주요국 when:3d',
- '생활/문화':'한국 문화축제 전시 공연 일정 when:5d',
+ '생활/문화':'생활 소비자 피해 교통 주거 교육 지원 환급 건강 안전 문화 when:5d',
  '건강보험':'건보공단 건강보험 환급금 본인부담금 보험급여 when:21d',
  '보험제도':'금융위원회 실손보험 보험금 청구 보험제도 when:21d',
  '보건정책':'보건복지부 의료정책 의료시설 when:7d',
@@ -66,6 +67,70 @@ NEWS_QUERIES = {
 BAD_TITLES = ('민원인안내서', '주요통계(기간별)', '홈페이지', '메인페이지', '바로가기',
               '보도자료 목록', '이용약관', '기사 목록', '사진자료실', 'RSS 서비스', '[사설]',
               '[칼럼]', '[기고]', '독자투고', '광고', '오피니언', '초대합니다')
+# 편집 원칙: 일반 독자의 생활과 실제 변화 중심. 점수는 자료를 조작하지 않고
+# 신뢰 가능한 원문 후보의 순서만 조절한다. 사진기사·의례적 인사는 후순위.
+PHOTO_MARKERS = ('[뉴시스pic]', '[포토]', '[사진]', '[현장포토]', '[포토뉴스]', '[영상]', '[화보]')
+LOW_INFORMATION = ('기념촬영', '악수', '포즈를 취', '인사를 나눴', '언론공개회')
+ECON_KOREA = ('코스피', '코스닥', '한국은행', '금통위', '원/달러', '원달러', '국내 증시',
+              '국내 주식', '한국 증시', '가계대출', '대출금리', '기준금리', '물가',
+              '소비자물가', '주택가격', '전세', '한국 경제', '국내 경제', '고용')
+ECON_US = ('미국 증시', '뉴욕 증시', '뉴욕증시', '나스닥', 's&p', '연준', 'fomc',
+           '미국 금리', '미국 물가', '다우지수', '엔비디아', '미 반도체')
+ECON_OTHER_MARKETS = ('대만 증시', '대만 주식', '타이베이 증시', '자취안',
+                      '일본 증시', '닛케이', '중국 증시', '상하이 증시', '유럽 증시')
+LIFE_USEFUL = ('교통', '지하철', '버스', '요금', '환급', '지원금', '소비자', '피해',
+               '주거', '전세', '월세', '주택', '교육', '학교', '안전', '화재',
+               '식품', '식중독', '예방접종', '신청', '생활비', '난방비', '통신비')
+LIFE_EVENTS = ('전시', '공연', '축제', '미술관', '음악회', '언론공개회', '개막')
+TOPIC_STOPWORDS = {'오늘','어제','내일','정부','한국','국내','사회','경제','정치','국제',
+                   '관련','분야','소식','종합','속보','논란','발표','추진','문제',
+                   '기자','뉴시스','연합뉴스','공개','확인','완료','새로운','내용',
+                   '대해','위해','가운데','이날','오는','대한','있다','했다'}
+
+
+def headline_topic_terms(title: str) -> list[str]:
+    """원문 제목의 식별 가능한 주요 단어. 비교만 하며 사실을 생성하지 않는다."""
+    terms=re.findall(r'[가-힣A-Za-z0-9]{2,}', compact(title).lower())
+    return [t for t in terms if t not in TOPIC_STOPWORDS and len(t)>=2]
+
+
+def topic_matches_title(source_title: str, written: str) -> bool:
+    """다른 기사의 문단이 끼어들었는지 탐지하는 보수적 안전장치."""
+    terms=[t for t in headline_topic_terms(source_title) if len(t)>=3]
+    if len(terms)<2:
+        return True   # 정보가 적은 제목은 이 규칙만으로 오류라고 확정하지 않음
+    target=normalize(written)
+    # 한국어 조사나 활용을 고려해 정규화된 부분 일치를 사용한다.
+    return any(normalize(t) in target for t in terms)
+
+
+def editorial_priority(a: dict) -> float:
+    """생활밀착도·중요도 우선 순위(기사 합격/불합격 기준과 분리)."""
+    title=compact(a.get('title','')).lower()
+    category=a.get('category','')
+    value=0.0
+    if any(x in title for x in PHOTO_MARKERS): value-=100
+    if any(x in title for x in LOW_INFORMATION): value-=22
+    if category=='경제':
+        if any(x in title for x in ECON_KOREA): value+=70
+        elif any(x in title for x in ECON_US): value+=46
+        elif any(x in title for x in ECON_OTHER_MARKETS): value-=35
+        else: value+=9
+    elif category=='생활/문화':
+        if any(x in title for x in LIFE_USEFUL): value+=60
+        if any(x in title for x in LIFE_EVENTS): value-=22
+    elif category=='정치':
+        if any(x in title for x in ('합의','의결','통과','시행','국회','법안','안보','협력','대책','후속')):
+            value+=19
+    elif category=='사회':
+        if any(x in title for x in ('안전','범죄','학교','교육','교통','사고','복지','대응','피해')):
+            value+=16
+    elif category=='국제':
+        if any(x in title for x in ('전쟁','휴전','협상','제재','외교','무역','안보','국제유가')):
+            value+=14
+    return value
+
+
 BANNED_FILLER = ('주요 정책의 추진', '향후 논의 방향', '관련 논의가 이어',
     '정부 발표 이후', '공식 발표를 통해 구분', '시행 여부는 공식', '세부 일정과 시행 여부',
     '주요 현안 관련', '대내외 불확실성이 남아', '신중한 판단이 필요',
@@ -146,18 +211,26 @@ def parse_feed(xml_bytes: bytes, *, limit: int = 55) -> list[dict]:
         if not title or not valid_link(url) or any(s.lower() in title.lower() for s in BAD_TITLES):
             continue
         raw_date=field('pubDate','{http://www.w3.org/2005/Atom}published','{http://www.w3.org/2005/Atom}updated')
+        dt=None
         try:
             dt=parsedate_to_datetime(raw_date)
             if dt.tzinfo is None: dt=dt.replace(tzinfo=KST)
             day=dt.astimezone(KST).date().isoformat()
         except (TypeError,ValueError,IndexError,AttributeError):
-            try: day=date.fromisoformat(raw_date[:10]).isoformat()
-            except (TypeError,ValueError): continue
+            try:
+                dt=datetime.fromisoformat(raw_date.replace('Z','+00:00'))
+                if dt.tzinfo is None: dt=dt.replace(tzinfo=KST)
+                day=dt.astimezone(KST).date().isoformat()
+            except (TypeError,ValueError,AttributeError):
+                dt=None
+                try: day=date.fromisoformat(raw_date[:10]).isoformat()
+                except (TypeError,ValueError): continue
+        published_at = dt.astimezone(KST).isoformat() if isinstance(dt,datetime) else ''
         desc=compact(field('description','{http://www.w3.org/2005/Atom}summary',
                 '{http://purl.org/rss/1.0/modules/content/}encoded'))
         source=compact(field('source')) or (urlsplit(url).hostname or '').replace('www.','')
         if title.endswith(' - '+source): title=title[:-(len(source)+3)]
-        result.append({'title':title,'url':url,'date':day,'source':source,'snippet':desc[:700]})
+        result.append({'title':title,'url':url,'date':day,'source':source,'snippet':desc[:700],'published_at':published_at})
     return result
 
 
@@ -331,7 +404,7 @@ def _compact_long_summary(item: dict) -> dict:
     """
     out=dict(item)
     summary=compact(out.get('summary',''))
-    if 70 <= len(summary) <= 125:
+    if 55 <= len(summary) <= 125:
         out['summary']=summary
         return out
     if len(summary)>125:
@@ -347,9 +420,9 @@ def _compact_long_summary(item: dict) -> dict:
 def candidate_score(a: dict, today:date) -> float:
     delta=max(0,(today-date.fromisoformat(a['date'])).days)
     contents=a.get('content','')
-    # 회의일시·시행일·금액 등 객관적 사실이 있는 기사를 우선한다.
-    numeric=min(8,len(re.findall(r'\d',contents)))
-    return 40-delta*3 + min(20,len(contents)//240)+numeric*2
+    # 새 편집 우선순위 > 단순 분량·숫자 개수. 보도사진은 후순위.
+    numeric=min(6,len(re.findall(r'\d',contents)))
+    return editorial_priority(a) + 40 - delta*3 + min(15,len(contents)//300) + numeric
 
 
 def _is_google_news_url(url: str) -> bool:
@@ -427,8 +500,10 @@ def _fetch_verified_entries(items: list[dict], category: str, seen_urls: set[str
 
 
 def collect_candidates(categories: tuple[str,...], *, today: date | None=None,
-                       max_per_category: int=5) -> dict[str,list[dict]]:
-    today = today or datetime.now(KST).date()
+                       max_per_category: int=5, as_of: datetime | None=None) -> dict[str,list[dict]]:
+    as_of = as_of or (datetime.combine(today, dt_time.max, KST) if today else datetime.now(KST))
+    if as_of.tzinfo is None: raise ValueError('as_of must include timezone')
+    today = today or as_of.astimezone(KST).date()
     out = {}
     seen_urls: set[str] = set()
     for category in categories:
@@ -453,6 +528,18 @@ def collect_candidates(categories: tuple[str,...], *, today: date | None=None,
                         else 4)
             if not is_recent(item['date'],max_days=max_days,now=today):
                 continue
+            stamp=item.get('published_at')
+            # 당일 발행 자료인데 시각이 누락되면 발송 이후 기사일 수 있다.
+            # 운영 중에는 사용하지 않는다(과거 날짜의 오프라인 테스트는 예외).
+            if (not stamp and item['date']==today.isoformat()
+                    and as_of.astimezone(KST).time()!=dt_time.max):
+                continue
+            if stamp:
+                try:
+                    if datetime.fromisoformat(stamp).astimezone(KST)>as_of.astimezone(KST):
+                        continue  # 발송 시점 이후 공개된 기사는 사용 금지
+                except (TypeError, ValueError):
+                    continue
             if item['url'] in seen_urls or item['url'] in used or any(
                 s.lower() in item['title'].lower() for s in BAD_TITLES):
                 continue
@@ -460,13 +547,13 @@ def collect_candidates(categories: tuple[str,...], *, today: date | None=None,
                 continue
             plausible.append(item)
             used.add(item['url'])
-        # Prioritize actual publisher links *before* Google RSS wrappers;
-        # the old 'newest 12' rule silently picked 12 Google landing pages.
+        # 제목 기준 1차 순위 뒤에 원문을 수집해 높은 가치의 기사에 검증 예산을 사용한다.
+        # 최신 보도사진이 먼저 22개를 차지하는 현상을 방지한다.
         publishers = sorted([a for a in plausible if not _is_google_news_url(a['url'])],
-                            key=lambda a:a['date'], reverse=True)
+                            key=lambda a:(editorial_priority({**a,'category':category}),a['date']), reverse=True)
         enriched = _fetch_verified_entries(publishers,category,seen_urls,trials=22)
         googles = sorted([a for a in plausible if _is_google_news_url(a['url'])],
-                         key=lambda a:a['date'], reverse=True)
+                         key=lambda a:(editorial_priority({**a,'category':category}),a['date']), reverse=True)
         decoded_count = 0
         if len(enriched) < max_per_category and googles:
             decoded = _decode_google_rows(googles,limit=14)
@@ -487,7 +574,8 @@ def _check_details(item:dict, evidence_source:str, *, number_source:str | None=N
     headline=compact(item.get('headline',''))
     summary=compact(item.get('summary',''))
     if not (18<=len(headline)<=56): return False, '제목이 너무 짧거나 길음'
-    if not (70<=len(summary)<=125): return False, f'설명 길이 {len(summary)}자(필요: 70~125자), 확인된 사실을 2~3개 포함해야 함'
+    minimum = 55 if item.get('category') in GENERAL_CATEGORIES else 70
+    if not (minimum<=len(summary)<=125): return False, f'설명 길이 {len(summary)}자(필요: {minimum}~125자), 확인된 사실을 포함해야 함'
     if not re.search(r'[가-힣]',headline+summary): return False,'한글 뉴스 문장이 아님'
     if any(x in headline+summary for x in BANNED_FILLER): return False,'공허한 상투적 표현'
     if '…' in headline or '...' in headline: return False,'제목이 잘림'
@@ -511,6 +599,10 @@ def _check_details(item:dict, evidence_source:str, *, number_source:str | None=N
 
 def validate_article(item:dict, source:dict) -> tuple[bool,str]:
     if item.get('candidate_id')!=source.get('candidate_id'):return False,'선택 후보와 근거 자료 불일치'
+    if (source.get('category') in GENERAL_CATEGORIES and
+        not topic_matches_title(source.get('title',''),
+                                compact(item.get('headline',''))+' '+compact(item.get('summary','')))):
+        return False,'원문 기사 제목과 작성 원고의 주제가 다름'
     return _check_details(item, source.get('content',''), number_source=' '.join(
         str(source.get(part, '') or '') for part in ('title', 'date', 'content')))
 
@@ -556,20 +648,20 @@ def _call_gemini(key:str, input_payload:list[dict], needed_categories:tuple[str,
             for a in input_payload]
     instruction='''당신은 한국어 뉴스 편집자입니다. 고객에게 전달할 뉴스이므로 아래 원문에서 확인되는 사실만 사용하세요.
 각 category에서 원문 근거가 확인되는 중요한 기사 1건을 선택합니다. 제공된 근거 문장이 두 개 이상 있으면 먼저 그 문장들을 바탕으로 완성하세요.
-자료에 없는 사실을 추가하지 마세요. 정말로 서로 다른 사실 근거가 두 개 미만인 경우에만 해당 category를 생략하세요.
+자료에 없는 사실을 추가하지 마세요. 사진 촬영·악수·행사 개최 자체보다 결정·변경·조치·영향을 우선하세요. 독립 근거가 2개 미만이면 해당 category를 생략하세요.
 headline은 18~56자이며, 누가 무엇을 했는지 구체적으로 드러나야 합니다.
-summary는 공백과 문장부호를 포함해 **반드시 70~125자**로 작성합니다. 목표는 90~105자입니다.
-요약은 제목을 반복하지 말고 실제 원문에 나온 사실 2~3개를 자연스러운 2문장으로 연결합니다.
+summary는 공백과 문장부호를 포함해 기본 70~110자로 작성하되, 일반 아침뉴스는 내용이 충분하면 55~125자를 허용합니다. 의료 뉴스는 70~125자를 유지합니다. 불필요한 사실로 글자 수를 채우지 마세요.
+헤드라인에서 핵심 결과를 전달하고 요약은 제목에 없는 배경·조치·수치·영향 등 새로운 사실을 전달합니다. 이미 제목에 담긴 사건 설명을 되풀이하지 마세요. 내용이 충분하면 자연스러운 1~2문장으로 편집하세요.
 사실이 부족할 때는 분량을 채우려고 관용구를 붙이지 말고, 같은 카테고리의 다른 후보를 사용하세요.
 ‘논의가 이어집니다’, ‘추가 발표를 확인해야 합니다’, ‘중요합니다’, ‘관심이 높습니다’처럼 새 사실이 없는 문장은 절대 금지합니다.
-출처명·신문사명·기사 날짜를 본문 아래에 쓰지 마세요. 헤드라인을 본문 첫머리에 다시 붙이지 마세요.
+맞춤법, 조사, 문장 호응을 검토하고 동일 명사의 불필요한 반복을 줄이세요. 고유명사·전시명·정책명은 원문 표기를 보존하고 작품·전시 제목에는 따옴표를 사용하세요. 모든 문장은 '~습니다'체로 마무리하세요. 출처명·신문사명·기사 날짜를 본문 아래에 쓰지 마세요. 헤드라인을 본문 첫머리에 다시 붙이지 마세요.
 정치·의료 정책에서 제안/검토/발표/확정/시행을 혼동하지 마세요. 신약은 연구/비임상/임상/허가/급여를 구분하세요.
 수치를 쓰려면 원문의 숫자 표기를 그대로 쓰고 새로운 수치·기간·일정을 만들어내지 마세요.
 원문 전체를 그대로 붙여 넣지 않고 관련 근거 문장만 압축해 evidence_catalog에 제시했습니다. 이 자료는 기사 원문에서 그대로 추출한 사실입니다.
 각 ID의 문장을 그대로 복사하는 대신 사실을 정확하게 요약하세요. 원문에는 사전에 추출한 evidence_catalog가 있습니다. evidence_ids 배열에는 **선택한 후보의 evidence_catalog에서 서로 다른 문장 ID 두 개**(예: ["E03","E07"])만 골라 넣으세요.
 인용문을 직접 재작성하거나 창작하지 마세요. 두 ID의 근거 문장이 summary의 핵심 사실을 실제로 뒷받침해야 합니다.
 독립적인 사실 2개가 확인되지 않는 후보는 선택하지 마세요.
-응답 전 headline 길이와 summary 길이를 스스로 세고, summary가 70~125자가 아니면 고쳐서 제출하세요.
+응답 전 headline 및 summary 길이를 확인하세요. 일반 아침뉴스는 55~125자, 보험·의료 뉴스는 70~125자이며 원문에서 확인되지 않는 사실을 추가하지 마세요.
 반드시 {"items":[{"category":"...","candidate_id":"원문 후보 id","headline":"...","summary":"...","evidence_ids":["E01", "E02"]}]} JSON만 출력하세요.
 요청 카테고리: ''' + ', '.join(needed_categories)
     if len(needed_categories)==1 and len(input_payload)==1:
@@ -800,9 +892,9 @@ def _narrow_ai_repair(key: str, candidate: dict) -> dict | None:
     instruction=('다음 한국어 뉴스 기사에서 실제로 추출한 완결된 사실 문장 두 개만 이용해 '
        '고객에게 보여줄 요약을 작성해 주세요. 문장에 없는 일시·숫자·기관·제도·시행 여부를 만들어서는 안 됩니다. '
        '확정/제안/검토/시행을 구분하고 자극적인 해석이나 상투적인 말은 제외하세요. '
-       'headline은 18~56자, summary는 공백 포함 70~125자이며 실제 사실 2개를 담은 자연스러운 두 문장입니다. '
+       'headline은 18~56자, summary는 공백 포함 55~125자(보험·의료는 70~125자)이며 실제 사실 2개를 담은 자연스러운 1~2문장입니다. '
        '제목을 그대로 본문 앞에 반복하지 마세요. 단 한 건에 대해 headline과 summary 두 문자열을 반드시 반환하세요. '
-       '요약에 나타나는 모든 숫자는 제공된 출처 제목 또는 아래 사실 문장에 나오는 숫자여야 합니다. '
+       '요약에 나타나는 모든 숫자는 제공된 출처 제목 또는 아래 사실 문장에 나오는 숫자여야 합니다. 원문에서 확인되지 않는 새로운 효과나 향후 일정은 추가하지 마세요. 같은 의미를 반복해서 분량을 채우지 마세요. '
        '원문 제목: '+raw_title+'\n근거1: '+source1+'\n근거2: '+source2)
     schema={'type':'OBJECT','properties':{'headline':{'type':'STRING'},'summary':{'type':'STRING'}},
             'required':['headline','summary']}
@@ -858,7 +950,8 @@ def _safe_extractive_fallback(article: dict) -> dict | None:
             if tokens_a and tokens_b and len(tokens_a & tokens_b) / min(len(tokens_a), len(tokens_b)) > .82:
                 continue
             summary = _formalize_source_sentence(text_a) + ' ' + _formalize_source_sentence(text_b)
-            if not (70 <= len(summary) <= 125):
+            minimum = 55 if article.get('category') in GENERAL_CATEGORIES else 70
+            if not (minimum <= len(summary) <= 125):
                 continue
             # Conservative copyright guard: never use more than 25 whitespace
             # separated words verbatim from a single private news source.
