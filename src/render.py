@@ -213,15 +213,24 @@ def draw_weather_market(im,d,weather,market):
     block(d,(38,768),narrative,294,5,16,24,min_size=13.3)
     valid=weather.get('cities') or {}
     cities=['서울','부산','대구','광주']
-    for city in cities:
-        if not valid.get(city):raise ValueError('날씨 정보 누락: '+city)
+    # Weather is a supplementary panel, not evidence for the news stories.
+    # An unavailable city forecast must never become fabricated numbers or
+    # prevent an otherwise verified news issue from being delivered.
     paste('thermometer',im,28,907,26,41)
     d=ImageDraw.Draw(im)
     for i,city in enumerate(cities):
         x=63+72*i
-        entry=valid[city]
+        entry=valid.get(city)
         txt(d,(x,909),city,15,True,NAVY)
-        txt(d,(x,934),f'{entry["lo"]}/{entry["hi"]}°C',13.7,True,NAVY)
+        temperatures = (isinstance(entry,dict)
+                        and isinstance(entry.get('lo'),(int,float))
+                        and isinstance(entry.get('hi'),(int,float))
+                        and math.isfinite(entry['lo']) and math.isfinite(entry['hi']))
+        if temperatures:
+            label=f'{entry["lo"]}/{entry["hi"]}°C'
+            txt(d,(x,934),label,13.7,True,NAVY)
+        else:
+            txt(d,(x,934),'확인 불가',12.2,False,MUTED)
         if i and i<=3:line(d,(x-9,906,x-9,960),fill='#d6e4ef',width=1)
     # Each number has independently confirmed date in verification.json and HTML source panel.
     kospi=_market_entry(market,'KOSPI')

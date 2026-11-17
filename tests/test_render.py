@@ -142,3 +142,22 @@ def test_long_realistic_international_report_fits_morning(tmp_path):
     target = tmp_path / 'repro-news-overflow.png'
     render_morning(target, '2026-11-15', '23:00', rows, fake_weather(), fake_market(), False)
     assert target.exists()
+
+
+def test_missing_city_weather_does_not_block_verified_news(tmp_path):
+    weather = fake_weather()
+    weather['cities']['서울'] = None
+    target = tmp_path / 'partial-weather.png'
+    render_morning(target, '2026-11-17', '05:55',
+                   [sample(cat, i) for i, cat in enumerate(CATEGORIES)],
+                   weather, fake_market(), False)
+    assert target.exists()
+
+def test_all_city_weather_missing_does_not_invent_numbers(tmp_path):
+    weather = { 'narrative': '주요 도시의 날씨 예보를 확인하지 못했습니다.',
+                'cities': {city: None for city in ('서울','부산','대구','광주')} }
+    target = tmp_path / 'no-weather.png'
+    render_morning(target, '2026-11-17', '05:55',
+                   [sample(cat, i) for i, cat in enumerate(CATEGORIES)],
+                   weather, fake_market(), False)
+    assert target.exists()
