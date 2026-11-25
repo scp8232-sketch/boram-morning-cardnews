@@ -146,29 +146,30 @@ def main():
     base = os.environ.get('PAGES_BASE_URL', '').strip()
     if not base.startswith('https://'):
         raise RuntimeError('GitHub Pages 배포 주소를 먼저 설정해야 합니다.')
-    # 수동 시험 발송과 정기 예약 발송은 서로 독립적으로 기록한다.
-    # 기존 v12 기록은 날짜별 배열이었다. 대부분 수동 테스트에서 생긴 이 기록은
-    # 예약 발송을 차단해서는 안 된다(예: 새벽 00:47 시험 후 06:13 예약 실행).
+    # All triggers (scheduled, workflow_run, manual) share ONE daily delivery ledger.
+    # Never use the GitHub run ID for deduplication: every event gets a new ID.
     sent = json.loads(SENT_FILE.read_text(encoding='utf-8')) if SENT_FILE.exists() else {}
     old_record = sent.get(date, {})
     if isinstance(old_record, list):
         day_record = {'legacy': sorted(set(old_record))}
-        print('이전 형식 발송 기록을 보존합니다. 예약 발송을 차단하지 않습니다.')
     elif isinstance(old_record, dict):
         day_record = old_record
     else:
         raise RuntimeError('기존 발송 기록 형식이 올바르지 않습니다. 기록을 덮어쓰지 않습니다.')
 
-    event = os.environ.get('GITHUB_EVENT_NAME', '').strip()
-    run_id = os.environ.get('GITHUB_RUN_ID', 'local').strip() or 'local'
-    # GitHub 예약 실행은 하루 1회만, 수동 실행은 사용자가 누른 각 실행마다 1회만.
-    # 한밤중에 수동 발송했어도 그날 아침 예약 발송은 반드시 다시 시도한다.
-    delivery_id = 'schedule' if event == 'schedule' else 'manual-' + run_id
-    completed = set(day_record.get(delivery_id, []))
-    if completed == {'morning', 'medical'}:
-        print(f'이미 완료한 발송입니다({date}, {delivery_id}). 재발송을 생략합니다.')
+    # Read both historic per-run receipts and the new shared daily receipt.
+    # This also prevents a newly patched run from duplicating cards already
+    # delivered on the same day by the older workflow implementation.
+    known_cards = {'morning', 'medical'}
+    completed = set()
+    for key, receipt in day_record.items():
+        if isinstance(receipt, list):
+            completed.update(set(receipt) & known_cards)
+    delivery_id = 'daily'
+    if completed == known_cards:
+        print(f'오늘자 두 카드 이미 전송 완료: {date}. 재발송 생략.')
         return
-    print(f'발송 종류: {"예약" if event == "schedule" else "수동"} / 발행일: {date} / 실행: {delivery_id}')
+    print(f'하루 1회 발송 / 발행일: {date} / 남은 카드: {sorted(known_cards-completed)}')
     token = refreshed_access_token()
     for key, title in [('morning', '이보람의 MORNING POST'), ('medical', '보험·의료 브리핑')]:
         if key in completed:
