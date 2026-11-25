@@ -1,0 +1,77 @@
+name: 카드뉴스 카카오톡 발송 전용
+
+on:
+  workflow_run:
+    workflows: ["이보람의 평일 아침 카드뉴스", "카드뉴스 Pages 배포 복구"]
+    types: [completed]
+  schedule:
+    # Seoul 06:15, 06:40, 06:55 (previous UTC day 21:15/21:40/21:55)
+    - cron: '15,40,55 21 * * 0-4'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: morning-cardnews-kakao-delivery-ledger
+  cancel-in-progress: false
+
+jobs:
+  send-existing-cards:
+    # Failed build/deploy can be recovered by one of the scheduled deliveries.
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: 최신 발송 기록 불러오기
+        run: |
+          git fetch origin main
+          git reset --hard origin/main
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 카카오 인증용 패키지 설치
+        run: pip install 'requests>=2.32,<3' 'cryptography>=43,<47'
+      - name: 저장된 오늘 뉴스의 미전송 카드만 발송
+        env:
+          KAKAO_REST_API_KEY: ${{ secrets.KAKAO_REST_API_KEY }}
+          KAKAO_CLIENT_SECRET: ${{ secrets.KAKAO_CLIENT_SECRET }}
+          KAKAO_REFRESH_TOKEN: ${{ secrets.KAKAO_REFRESH_TOKEN }}
+          PAGES_BASE_URL: https://scp8232-sketch.github.io/boram-morning-cardnews/
+          # One daily ledger across workflow_run, schedules and manual retries.
+          GITHUB_EVENT_NAME: schedule
+        run: python -m src.send_kakao
+      - name: 인증 토큰과 발송 기록 저장 (성공 및 부분 성공)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          temp=$(mktemp -d)
+          for name in data/kakao_refresh.enc data/sent.json; do
+            if [ -f "$name" ]; then
+              mkdir -p "$temp/$(dirname "$name")"
+              cp "$name" "$temp/$name"
+            fi
+          done
+          saved=false
+          for attempt in 1 2 3 4; do
+            git fetch origin main
+            git reset --hard origin/main
+            for name in data/kakao_refresh.enc data/sent.json; do
+              if [ -f "$temp/$name" ]; then cp "$temp/$name" "$name"; fi
+            done
+            git add data/kakao_refresh.enc data/sent.json 2>/dev/null || true
+            if git diff --cached --quiet; then saved=true; break; fi
+            git commit -m 'security: persist Kakao delivery ledger'
+            if git push origin HEAD:main; then saved=true; break; fi
+            sleep $((attempt*4))
+          done
+          if [ "$saved" != true ]; then echo '발송기록 저장 실패: 재시도 시 중복 위험' >&2; exit 1; fi
+      - name: 실패 사유 확인
+        if: failure()
+        run: |
+          echo 'Actions 로그 확인: 오늘자 제작, Pages 공개, Kakao 인증과 발송기록 순서로 확인하세요.'

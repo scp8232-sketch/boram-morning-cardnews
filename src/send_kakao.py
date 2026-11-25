@@ -41,10 +41,25 @@ def refreshed_access_token() -> str:
         refresh = seed
     if not refresh:
         raise RuntimeError('KAKAO_REFRESH_TOKEN 설정이 필요합니다. README의 최초 연결 절차를 참고하세요.')
-    response = requests.post('https://kauth.kakao.com/oauth/token', data={
-        'grant_type': 'refresh_token', 'client_id': rest_key,
-        'client_secret': secret, 'refresh_token': refresh,
-    }, timeout=20)
+    # A temporary network connection failure must not cancel a completed news issue.
+    # Only retry failures known to occur before a successful HTTP response.
+    response = None
+    for attempt in range(4):
+        try:
+            response = requests.post('https://kauth.kakao.com/oauth/token', data={
+                'grant_type': 'refresh_token', 'client_id': rest_key,
+                'client_secret': secret, 'refresh_token': refresh,
+            }, timeout=(15, 25))
+            if response.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+                time.sleep((5, 12, 25)[attempt])
+                continue
+            break
+        except (requests.ConnectTimeout, requests.ConnectionError) as exc:
+            if attempt == 3:
+                raise RuntimeError('카카오 인증 서버 연결이 네 차례 실패했습니다.') from exc
+            time.sleep((5, 12, 25)[attempt])
+    if response is None:
+        raise RuntimeError('카카오 인증 응답을 받지 못했습니다.')
     if response.status_code != 200:
         raise RuntimeError(f'카카오 토큰 갱신 실패: HTTP {response.status_code}. 연결 해제 여부와 Secret을 확인하세요.')
     reply = response.json()
@@ -58,15 +73,15 @@ def refreshed_access_token() -> str:
 
 
 def wait_page(url: str) -> None:
-    for attempt in range(16):
+    for attempt in range(5):
         try:
             response = requests.get(url, timeout=20)
             if response.status_code == 200 and response.headers.get('Content-Type', '').startswith('image/'):
                 return
         except requests.RequestException:
             pass
-        if attempt != 15:
-            time.sleep(12)
+        if attempt != 4:
+            time.sleep(10)
     raise RuntimeError('GitHub Pages 이미지가 공개되지 않았습니다. Pages 설정과 배포 기록을 확인하세요.')
 
 
@@ -81,10 +96,22 @@ def send_one(token: str, title: str, image_url: str, original_url: str, date: st
         },
         'buttons': [{'title': '원본 이미지 열기', 'link': {'web_url': original_url, 'mobile_web_url': original_url}}],
     }
-    response = requests.post('https://kapi.kakao.com/v2/api/talk/memo/default/send',
-        headers={'Authorization': 'Bearer '+token},
-        data={'template_object': json.dumps(template, ensure_ascii=False, separators=(',', ':'))},
-        timeout=25)
+    # Only pre-connect errors can safely retry. A read timeout might mean
+    # Kakao accepted the message, so it is NOT automatically retried here.
+    response = None
+    for attempt in range(3):
+        try:
+            response = requests.post('https://kapi.kakao.com/v2/api/talk/memo/default/send',
+                headers={'Authorization': 'Bearer '+token},
+                data={'template_object': json.dumps(template, ensure_ascii=False, separators=(',', ':'))},
+                timeout=(12, 25))
+            break
+        except (requests.ConnectTimeout, requests.ConnectionError) as exc:
+            if attempt == 2:
+                raise RuntimeError('카카오 메시지 연결이 세 차례 실패했습니다.') from exc
+            time.sleep((6, 15)[attempt])
+    if response is None:
+        raise RuntimeError('카카오 메시지 API 응답을 받지 못했습니다.')
     if response.status_code != 200:
         raise RuntimeError(f'카카오 메시지 발송 실패: HTTP {response.status_code}. 제품 링크 도메인/동의항목을 확인하세요.')
     if response.json().get('result_code') != 0:
@@ -103,8 +130,8 @@ def generated_card_date() -> str:
     published = match.group(1)
     # 이전 실행의 오래된 카드를 새 카드로 오인해 전송하지 않도록 한다.
     age = (datetime.now(KST).date() - datetime.strptime(published, '%Y-%m-%d').date()).days
-    if age not in (0, 1):
-        raise RuntimeError('발행 날짜가 최신이 아닙니다. 오늘 카드가 정상 생성됐는지 확인하세요.')
+    if age != 0:
+        raise RuntimeError('오늘자 카드가 아닙니다. 과거 카드 자동 재전송을 차단합니다.')
     image_folder = ROOT / 'docs' / published
     for key in ('morning', 'medical'):
         for name in (f'{key}.png', f'{key}-preview.jpg'):

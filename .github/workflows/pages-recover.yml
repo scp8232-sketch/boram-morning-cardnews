@@ -1,0 +1,59 @@
+name: 카드뉴스 Pages 배포 복구
+
+on:
+  schedule:
+    # Seoul 06:10, 06:35; previous UTC day 21:10/21:35
+    - cron: '10,35 21 * * 0-4'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: morning-cardnews-pages-recover
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    concurrency:
+      group: morning-cardnews-pages-deploy
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: https://scp8232-sketch.github.io/boram-morning-cardnews/
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: 오늘 카드와 기존 배포 확인
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          day=$(TZ=Asia/Seoul date +%F)
+          if [ ! -f "docs/$day/morning.png" ] || [ ! -f "docs/$day/medical.png" ]; then
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            echo "오늘자 뉴스 미완성: $day"
+            exit 0
+          fi
+          url="https://scp8232-sketch.github.io/boram-morning-cardnews/$day/"
+          if curl -fsSL --max-time 12 "$url/morning-preview.jpg" -o /dev/null && \
+             curl -fsSL --max-time 12 "$url/medical-preview.jpg" -o /dev/null; then
+            echo 'ready=false' >> "$GITHUB_OUTPUT"
+            echo '오늘자 페이지 이미 공개됨. 재배포 불필요.'
+          else
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+            echo '오늘자 페이지가 없어 기존 뉴스로 Pages 배포 복구.'
+          fi
+      - name: 저장된 뉴스만 다시 업로드
+        if: steps.check.outputs.ready == 'true'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs
+      - name: Pages 배포 복구
+        if: steps.check.outputs.ready == 'true'
+        uses: actions/deploy-pages@v4
