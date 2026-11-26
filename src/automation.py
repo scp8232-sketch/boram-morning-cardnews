@@ -1,4 +1,4 @@
-"""뉴스 가져오기 → Gemini 보수적 요약 → PNG 카드 2장 → 출처 포함 공개 웹페이지."""
+"""확정 원고 한 벌 → 동일 원고 PNG 카드 2장 → 출처 포함 공개 웹페이지."""
 from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +12,7 @@ import requests
 from .sources import weather_today, market_data
 from .editorial import build_news, PublicationQualityError
 from .render import render_morning, render_medical
+from .edition import load as load_edition, seal
 
 KST = ZoneInfo('Asia/Seoul')
 ROOT = Path(__file__).resolve().parents[1]
@@ -126,7 +127,7 @@ def page(date: str, articles: list[dict], med: list[dict], weather: dict, market
                          for a in arr if a.get('url'))
     met = []
     for key, entry in market.items():
-        if entry and entry.get('source_url'):
+        if isinstance(entry, dict) and entry.get('source_url'):
             met.append(f'<li>{html.escape(key)} ({html.escape(entry.get("date", ""))}) · '
                        f'<a href="{html.escape(entry["source_url"], quote=True)}" target="_blank">기준 자료</a></li>')
     css = '<style>body{background:#eef2f4;color:#193047;font-family:sans-serif;max-width:920px;margin:auto;padding:20px}img{display:block;width:100%;max-width:640px;margin:12px auto;border-radius:20px}a{color:#215c8a;word-break:break-all}li{margin:9px 0}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:20px}.cards img{max-width:100%}details{background:white;border-radius:14px;padding:18px;margin:15px 0}small{color:#64768c}</style>'
@@ -176,17 +177,19 @@ def main():
             '순금 24K 1돈(살 때/팔 때)': {'buy': 0, 'sell': 0, 'date': day},
         }
     else:
-        # 원문 본문까지 확인하고, AI의 근거 인용을 검증한 경우에만 발행.
-        # 미검증 기사/공허한 문구가 하나라도 필수 영역에 들어오면 발행 자체를 중단한다.
-        general, medical = build_news()
-        weather = weather_today()
-        market = market_data()
+        # Chat preview and Kakao use ONE approved dated manuscript. Do not
+        # crawl, select or summarize a second set of stories at delivery time.
+        edition = load_edition(ROOT, date)
+        checked = edition['checked']
+        general, medical = edition['articles'], edition['medical']
+        weather, market = edition['weather'], edition['market']
     render_morning(folder / 'morning.png', date, checked, general, weather, market, demo)
     render_medical(folder / 'medical.png', date, checked, medical, demo)
     (folder / 'index.html').write_text(page(date, general, medical, weather, market, checked), encoding='utf-8')
     if not demo:
         report = {'date': date, 'checked': checked, 'articles': general, 'medical': medical, 'weather': weather, 'market': market}
         (folder / 'verification.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+        seal(folder, edition)
     if not demo:
         (DOCS / 'index.html').write_text('<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url='+date+'/">'
                                   '<a href="'+date+'/">오늘의 카드뉴스 보기</a>', encoding='utf-8')
@@ -195,3 +198,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 import math
 import re
 
-BW, BH, SCALE = 768, 990, 2
+BW, BH, SCALE = 768, 1110, 2
 W, H = BW*SCALE, BH*SCALE
 NAVY = '#071b40'
 INK = '#101d30'
@@ -25,6 +25,7 @@ ASSETS = Path(__file__).resolve().parents[1] / 'assets'
 
 def font_path(bold: bool=False) -> str:
     for p in (
+      ('/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc' if bold else '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'),
       ('/usr/share/fonts/truetype/nanum/NanumSquareB.ttf' if bold else '/usr/share/fonts/truetype/nanum/NanumSquareR.ttf'),
       ('/usr/share/fonts/truetype/nanum/NanumGothicBold.ttf' if bold else '/usr/share/fonts/truetype/nanum/NanumGothic.ttf'),
       ('/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc' if bold else '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'),
@@ -123,7 +124,11 @@ def sky_header(im, d, kind, date):
         edge=min(1,xx/(58*SCALE))
         for yy in range(graphic.height):
             fade=min(1,yy/(8*SCALE),(graphic.height-yy)/(13*SCALE))
-            mp[xx,yy]=round(255*max(0,edge)*max(0,fade))
+            # The old reference crop includes a masked text rectangle near
+            # its left foot. Do not composite that block into a new header.
+            leftover = (xx < (82 if kind=='medical' else 30)*SCALE
+                        and 105*SCALE <= yy <= 154*SCALE)
+            mp[xx,yy]=0 if leftover else round(255*max(0,edge)*max(0,fade))
     graphic.putalpha(mask)
     im.alpha_composite(graphic,(x*SCALE,6*SCALE))
     d=ImageDraw.Draw(im)
@@ -165,9 +170,9 @@ def draw_left_articles(im,d,articles):
         # Five rows share the 166..689px news area. 104px cards keep the
         # approved layout but accommodate a verified 70..125-character summary.
         # Never cut text with ellipses or silently discard a verified fact.
-        y=166+i*104
-        card_frame(d,y,102)
-        rect(d,(25,y+6,183,y+96),radius=15,fill=BADGE_GRAY)
+        y=166+i*128
+        card_frame(d,y,126)
+        rect(d,(25,y+6,183,y+120),radius=15,fill=BADGE_GRAY)
         paste(img,im,37,y+25,53,52)
         d=ImageDraw.Draw(im)
         if cat=='생활/문화':
@@ -178,13 +183,10 @@ def draw_left_articles(im,d,articles):
         head=art.get('headline') or art.get('title')
         summary=art.get('summary')
         n=block(d,(197,y+5),head,554,2,20,23,bold=True,min_size=17)
-        # Previous code allowed just two lines after a two-line headline;
-        # that cannot reliably hold the editor's 70..125-character summaries.
-        # Three measured lines fit the 102px news card (no text clipping).
-        if n==1:
-            block(d,(197,y+34),summary,548,3,14.6,18.4,min_size=12.0)
-        else:
-            block(d,(197,y+51),summary,548,3,13.4,16.7,min_size=11.8)
+        # Keep one readable body size across all five categories. Approved
+        # 120..180-character text uses 3..4 lines; never shorten the manuscript.
+        body_y = y+34 if n==1 else y+51
+        block(d,(197,body_y),summary,548,4,14.6,17.5,min_size=14.6)
 
 
 def _market_entry(m, key):
@@ -199,6 +201,11 @@ def _num(v,decimals=2):
 
 
 def draw_weather_market(im,d,weather,market):
+    # Offset the unchanged panel below the taller news section.
+    panel = Image.new('RGBA', im.size, (0,0,0,0))
+    target = im
+    im = panel
+    d = ImageDraw.Draw(im)
     rect(d,(20,691,349,969),radius=18,fill='#ffffff',outline='#9dcbf3',width=1)
     rect(d,(356,691,750,969),radius=18,fill='#ffffff',outline='#9dcbf3',width=1)
     # Soft blue cap band like approved sample.
@@ -212,14 +219,14 @@ def draw_weather_market(im,d,weather,market):
     narrative=weather.get('narrative','')
     block(d,(38,768),narrative,294,5,16,24,min_size=13.3)
     valid=weather.get('cities') or {}
-    cities=['서울','부산','대구','광주']
+    cities=['서울','대전','광주','대구','부산']
     # Weather is a supplementary panel, not evidence for the news stories.
     # An unavailable city forecast must never become fabricated numbers or
     # prevent an otherwise verified news issue from being delivered.
     paste('thermometer',im,28,907,26,41)
     d=ImageDraw.Draw(im)
     for i,city in enumerate(cities):
-        x=63+72*i
+        x=61+56*i
         entry=valid.get(city)
         txt(d,(x,909),city,15,True,NAVY)
         temperatures = (isinstance(entry,dict)
@@ -264,6 +271,9 @@ def draw_weather_market(im,d,weather,market):
     txt(d,(417,915),'금(1돈)',14.5,True,NAVY)
     txt(d,(493,914),f'살 때 {int(gold["buy"]):,}원',13.5,True,NAVY)
     txt(d,(493,939),f'팔 때 {int(gold["sell"]):,}원',13.5,True,NAVY)
+    txt(d,(375,958),'금 24K 3.75g · 살 때 부가세 포함',9,False,MUTED)
+
+    target.alpha_composite(panel,(0,120*SCALE))
 
 
 def _medical_image(article,i):
@@ -280,20 +290,16 @@ def draw_right_articles(im,d,articles):
     if len(articles)<5:
         raise ValueError('보험·의료 검증 기사 5건 미만: 발행하지 않음')
     for i,a in enumerate(articles[:5]):
-        y=181+i*151
-        card_frame(d,y,146)
+        y=181+i*175
+        card_frame(d,y,170)
         paste(_medical_image(a,i),im,798-768,y+16,135,115)
         d=ImageDraw.Draw(im)
         line(d,(183,y+13,183,y+134),'#d8e7f4',1)
         head=a.get('headline') or a.get('title')
         summary=a.get('summary')
         n=block(d,(191,y+18),head,558,2,20.8,25,bold=True,min_size=18)
-        # Also reserve three lines for two-line medical headlines. The card
-        # has enough vertical room; a verified summary must not be truncated.
-        if n==1:
-            block(d,(191,y+60),summary,552,3,15.4,21.5,min_size=12.5)
-        else:
-            block(d,(191,y+80),summary,552,3,14.5,19.5,min_size=12.0)
+        body_y = y+60 if n==1 else y+80
+        block(d,(191,body_y),summary,552,4,15.4,20,min_size=15.4)
 
 
 def save_img(im,path):
@@ -308,6 +314,7 @@ def save_img(im,path):
 
 def render_morning(path:Path,date:str,checked:str,articles:list[dict],weather:dict,market:dict,demo=False):
     im,d=rounded_paper();d=sky_header(im,d,'morning',date)
+    txt(d,(45,143),f'자료 확인 {checked} KST',9,False,MUTED)
     draw_left_articles(im,d,articles)
     draw_weather_market(im,d,weather,market)
     if demo:
@@ -318,8 +325,10 @@ def render_morning(path:Path,date:str,checked:str,articles:list[dict],weather:di
 
 def render_medical(path:Path,date:str,checked:str,articles:list[dict],demo=False):
     im,d=rounded_paper();d=sky_header(im,d,'medical',date)
+    txt(d,(45,143),f'자료 확인 {checked} KST',9,False,MUTED)
     draw_right_articles(im,d,articles)
     if demo:
         rect(ImageDraw.Draw(im),(610,947,745,975),radius=8,fill='#c0392b')
         txt(ImageDraw.Draw(im),(616,951),'디자인 시험용',15,True,'white')
     save_img(im,path)
+

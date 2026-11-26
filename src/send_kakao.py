@@ -1,6 +1,7 @@
 """카카오 '나와의 채팅'으로 미리보기 2개+원본 링크 발송. 갱신 토큰은 암호화해 저장."""
 from __future__ import annotations
 import base64
+import argparse
 from datetime import datetime
 import hashlib
 import json
@@ -10,6 +11,7 @@ import re
 import time
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
+from .edition import verify as verify_edition
 
 from cryptography.fernet import Fernet, InvalidToken
 import requests
@@ -72,17 +74,19 @@ def refreshed_access_token() -> str:
     return access
 
 
-def wait_page(url: str) -> None:
+def wait_page(url: str, *, expected_sha: str | None = None) -> None:
     for attempt in range(5):
         try:
             response = requests.get(url, timeout=20)
-            if response.status_code == 200 and response.headers.get('Content-Type', '').startswith('image/'):
+            if (response.status_code == 200
+                    and response.headers.get('Content-Type', '').startswith('image/')
+                    and (expected_sha is None or hashlib.sha256(response.content).hexdigest() == expected_sha)):
                 return
         except requests.RequestException:
             pass
         if attempt != 4:
             time.sleep(10)
-    raise RuntimeError('GitHub Pages 이미지가 공개되지 않았습니다. Pages 설정과 배포 기록을 확인하세요.')
+    raise RuntimeError('GitHub Pages 이미지가 공개되지 않았거나 확정 원고의 이미지와 다릅니다. 배포 기록을 확인하세요.')
 
 
 def send_one(token: str, title: str, image_url: str, original_url: str, date: str) -> None:
@@ -137,11 +141,15 @@ def generated_card_date() -> str:
         for name in (f'{key}.png', f'{key}-preview.jpg'):
             if not (image_folder / name).is_file():
                 raise RuntimeError(f'발행 파일이 없습니다: {published}/{name}')
+    verify_edition(ROOT, published)
     print(f'발행 날짜 확인: {published} (현재 한국 시간과 달라도 생성된 카드 날짜를 사용합니다)')
     return published
 
 
-def main():
+def main(*, test: bool = False):
+    if test and (os.environ.get('GITHUB_EVENT_NAME') != 'workflow_dispatch'
+                 or not re.fullmatch(r'\d+', os.environ.get('GITHUB_RUN_ID', ''))):
+        raise RuntimeError('테스트 발송은 명시적인 GitHub 수동 실행에서만 허용합니다.')
     date = generated_card_date()
     base = os.environ.get('PAGES_BASE_URL', '').strip()
     if not base.startswith('https://'):
@@ -149,7 +157,8 @@ def main():
     # All triggers (scheduled, workflow_run, manual) share ONE daily delivery ledger.
     # Never use the GitHub run ID for deduplication: every event gets a new ID.
     sent = json.loads(SENT_FILE.read_text(encoding='utf-8')) if SENT_FILE.exists() else {}
-    old_record = sent.get(date, {})
+    record_key = f'test-{date}-{os.environ.get("GITHUB_RUN_ID")}' if test else date
+    old_record = sent.get(record_key, {})
     if isinstance(old_record, list):
         day_record = {'legacy': sorted(set(old_record))}
     elif isinstance(old_record, dict):
@@ -176,11 +185,22 @@ def main():
             continue
         original_url = urljoin(base.rstrip('/')+'/', f'{date}/{key}.png')
         preview_url = urljoin(base.rstrip('/')+'/', f'{date}/{key}-preview.jpg')
-        wait_page(preview_url)
+        manifest_file = ROOT / 'docs' / date / 'publication.json'
+        manifest = None
+        if manifest_file.is_file():
+            manifest = json.loads(manifest_file.read_text(encoding='utf-8'))
+            version = manifest['manuscript_sha256'][:16]
+            original_url += '?v=' + version
+            preview_url += '?v=' + version
+        wait_page(preview_url, expected_sha=manifest['files'][f'{key}-preview.jpg'] if manifest else None)
+        if manifest:
+            wait_page(original_url, expected_sha=manifest['files'][f'{key}.png'])
+        if test:
+            title = '[테스트] ' + title
         send_one(token, title, preview_url, original_url, date)
         completed.add(key)
         day_record[delivery_id] = sorted(completed)
-        sent[date] = day_record
+        sent[record_key] = day_record
         SENT_FILE.parent.mkdir(parents=True, exist_ok=True)
         SENT_FILE.write_text(json.dumps(sent, ensure_ascii=False, indent=2)+'\n', encoding='utf-8')
         print(f'{title} 발송 API 성공 ({delivery_id})')
@@ -188,4 +208,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--test', action='store_true', help='수동으로 요청한 테스트 카드 두 장 발송')
+    main(test=parser.parse_args().test)
+
