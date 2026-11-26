@@ -108,7 +108,14 @@ def verify(root: Path, day: str) -> dict:
     folder = root / 'docs' / day
     try:
         manifest = json.loads((folder / 'publication.json').read_text(encoding='utf-8'))
-        edition = load(root, day)
+        if (root / 'editions' / f'{day}.json').is_file():
+            edition = load(root, day)
+        else:
+            # The established verified pipeline can produce the canonical
+            # manuscript without relying on a second app's write access.
+            edition = json.loads((folder / 'edition.json').read_text(encoding='utf-8'))
+            if not isinstance(edition, dict) or edition.get('date') != day:
+                raise EditionError('배포 원고의 발행일이 다릅니다.')
         if manifest.get('date') != day or manifest.get('manuscript_sha256') != digest(encoded(edition)):
             raise EditionError('확정 원고와 배포본이 다릅니다. 다시 렌더링해야 합니다.')
         expected = manifest.get('files', {})

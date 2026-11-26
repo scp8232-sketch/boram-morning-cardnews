@@ -5,6 +5,8 @@ from pathlib import Path
 import html
 import json
 import os
+import argparse
+import re
 from zoneinfo import ZoneInfo
 
 import requests
@@ -12,7 +14,7 @@ import requests
 from .sources import weather_today, market_data
 from .editorial import build_news, PublicationQualityError
 from .render import render_morning, render_medical
-from .edition import load as load_edition, seal
+from .edition import load as load_edition, seal, verify as verify_edition
 
 KST = ZoneInfo('Asia/Seoul')
 ROOT = Path(__file__).resolve().parents[1]
@@ -143,9 +145,18 @@ def page(date: str, articles: list[dict], med: list[dict], weather: dict, market
             '</body></html>')
 
 
-def main():
+def main(*, edition_date: str | None = None):
     now = datetime.now(KST)
     date = now.strftime('%Y-%m-%d')
+    if edition_date is not None:
+        if os.environ.get('GITHUB_EVENT_NAME') != 'workflow_dispatch':
+            raise RuntimeError('날짜 지정 제작은 수동 테스트 실행에서만 허용합니다.')
+        if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', edition_date):
+            raise RuntimeError('테스트 원고 날짜 형식이 잘못됐습니다.')
+        if datetime.strptime(edition_date, '%Y-%m-%d').date() > now.date():
+            raise RuntimeError('미래 날짜의 원고를 테스트할 수 없습니다.')
+        date = edition_date
+        load_edition(ROOT, date)  # explicit dated tests never generate substitute stories
     checked = now.strftime('%H:%M')
     demo = os.environ.get('RUN_DEMO') == '1'
     if demo:
@@ -177,9 +188,19 @@ def main():
             '순금 24K 1돈(살 때/팔 때)': {'buy': 0, 'sell': 0, 'date': day},
         }
     else:
-        # Chat preview and Kakao use ONE approved dated manuscript. Do not
-        # crawl, select or summarize a second set of stories at delivery time.
-        edition = load_edition(ROOT, date)
+        # A supplied, approved manuscript takes precedence. If preparation is
+        # interrupted or unavailable, keep the established verified news build
+        # working. A recovery run reuses the sealed manuscript, never reselects.
+        if (ROOT / 'editions' / f'{date}.json').is_file():
+            edition = load_edition(ROOT, date)
+        elif (folder / 'publication.json').is_file():
+            verify_edition(ROOT, date)
+            edition = json.loads((folder / 'edition.json').read_text(encoding='utf-8'))
+        else:
+            general, medical = build_news()
+            edition = {'date': date, 'checked': checked, 'articles': general,
+                       'medical': medical, 'weather': weather_today(),
+                       'market': market_data(), 'origin': 'verified_pipeline'}
         checked = edition['checked']
         general, medical = edition['articles'], edition['medical']
         weather, market = edition['weather'], edition['market']
@@ -190,12 +211,14 @@ def main():
         report = {'date': date, 'checked': checked, 'articles': general, 'medical': medical, 'weather': weather, 'market': market}
         (folder / 'verification.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
         seal(folder, edition)
-    if not demo:
+    if not demo and edition_date is None:
         (DOCS / 'index.html').write_text('<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url='+date+'/">'
                                   '<a href="'+date+'/">오늘의 카드뉴스 보기</a>', encoding='utf-8')
     print('완료:', folder / 'morning.png', folder / 'medical.png')
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--edition-date', help='수동 테스트용 확정 원고 날짜')
+    main(edition_date=parser.parse_args().edition_date)
 

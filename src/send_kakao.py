@@ -146,11 +146,19 @@ def generated_card_date() -> str:
     return published
 
 
-def main(*, test: bool = False):
+def main(*, test: bool = False, edition_date: str | None = None):
     if test and (os.environ.get('GITHUB_EVENT_NAME') != 'workflow_dispatch'
                  or not re.fullmatch(r'\d+', os.environ.get('GITHUB_RUN_ID', ''))):
         raise RuntimeError('테스트 발송은 명시적인 GitHub 수동 실행에서만 허용합니다.')
-    date = generated_card_date()
+    if edition_date is not None:
+        if not test or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', edition_date):
+            raise RuntimeError('날짜 지정 발송은 명시적인 수동 테스트에서만 허용합니다.')
+        if datetime.strptime(edition_date, '%Y-%m-%d').date() > datetime.now(KST).date():
+            raise RuntimeError('미래 날짜의 원고를 전송할 수 없습니다.')
+        verify_edition(ROOT, edition_date)
+        date = edition_date
+    else:
+        date = generated_card_date()
     base = os.environ.get('PAGES_BASE_URL', '').strip()
     if not base.startswith('https://'):
         raise RuntimeError('GitHub Pages 배포 주소를 먼저 설정해야 합니다.')
@@ -210,5 +218,7 @@ def main(*, test: bool = False):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--test', action='store_true', help='수동으로 요청한 테스트 카드 두 장 발송')
-    main(test=parser.parse_args().test)
+    parser.add_argument('--edition-date', help='수동 테스트로 명시한 확정 원고 날짜')
+    args = parser.parse_args()
+    main(test=args.test, edition_date=args.edition_date)
 

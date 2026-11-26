@@ -404,14 +404,14 @@ def _compact_long_summary(item: dict) -> dict:
     """
     out=dict(item)
     summary=compact(out.get('summary',''))
-    if 55 <= len(summary) <= 125:
+    if 55 <= len(summary) <= 180:
         out['summary']=summary
         return out
-    if len(summary)>125:
+    if len(summary)>180:
         sentences=re.split(r'(?<=[.!?。])\s+',summary)
         for count in range(len(sentences)-1,0,-1):
             fragment=' '.join(sentences[:count]).strip()
-            if 70 <= len(fragment) <= 125 and fragment.endswith(('.', '!', '?', '。')):
+            if 70 <= len(fragment) <= 180 and fragment.endswith(('.', '!', '?', '。')):
                 out['summary']=fragment
                 return out
     out['summary']=summary
@@ -575,7 +575,7 @@ def _check_details(item:dict, evidence_source:str, *, number_source:str | None=N
     summary=compact(item.get('summary',''))
     if not (18<=len(headline)<=56): return False, '제목이 너무 짧거나 길음'
     minimum = 55 if item.get('category') in GENERAL_CATEGORIES else 70
-    if not (minimum<=len(summary)<=125): return False, f'설명 길이 {len(summary)}자(필요: {minimum}~125자), 확인된 사실을 포함해야 함'
+    if not (minimum<=len(summary)<=180): return False, f'설명 길이 {len(summary)}자(필요: {minimum}~180자), 확인된 사실을 포함해야 함'
     if not re.search(r'[가-힣]',headline+summary): return False,'한글 뉴스 문장이 아님'
     if any(x in headline+summary for x in BANNED_FILLER): return False,'공허한 상투적 표현'
     if '…' in headline or '...' in headline: return False,'제목이 잘림'
@@ -650,7 +650,7 @@ def _call_gemini(key:str, input_payload:list[dict], needed_categories:tuple[str,
 각 category에서 원문 근거가 확인되는 중요한 기사 1건을 선택합니다. 제공된 근거 문장이 두 개 이상 있으면 먼저 그 문장들을 바탕으로 완성하세요.
 자료에 없는 사실을 추가하지 마세요. 사진 촬영·악수·행사 개최 자체보다 결정·변경·조치·영향을 우선하세요. 독립 근거가 2개 미만이면 해당 category를 생략하세요.
 headline은 18~56자이며, 누가 무엇을 했는지 구체적으로 드러나야 합니다.
-summary는 공백과 문장부호를 포함해 기본 70~110자로 작성하되, 일반 아침뉴스는 내용이 충분하면 55~125자를 허용합니다. 의료 뉴스는 70~125자를 유지합니다. 불필요한 사실로 글자 수를 채우지 마세요.
+summary는 공백과 문장부호를 포함해 기본 130~170자로 작성하되, 일반 아침뉴스는 내용이 충분하면 120~180자를 목표로 합니다. 의료 뉴스도 120~180자를 목표로 합니다. 근거가 부족하면 확인된 사실만 쓰며 55자(의료 70자) 미만이면 다른 기사를 고르세요. 불필요한 사실로 글자 수를 채우지 마세요.
 헤드라인에서 핵심 결과를 전달하고 요약은 제목에 없는 배경·조치·수치·영향 등 새로운 사실을 전달합니다. 이미 제목에 담긴 사건 설명을 되풀이하지 마세요. 내용이 충분하면 자연스러운 1~2문장으로 편집하세요.
 사실이 부족할 때는 분량을 채우려고 관용구를 붙이지 말고, 같은 카테고리의 다른 후보를 사용하세요.
 ‘논의가 이어집니다’, ‘추가 발표를 확인해야 합니다’, ‘중요합니다’, ‘관심이 높습니다’처럼 새 사실이 없는 문장은 절대 금지합니다.
@@ -661,7 +661,7 @@ summary는 공백과 문장부호를 포함해 기본 70~110자로 작성하되,
 각 ID의 문장을 그대로 복사하는 대신 사실을 정확하게 요약하세요. 원문에는 사전에 추출한 evidence_catalog가 있습니다. evidence_ids 배열에는 **선택한 후보의 evidence_catalog에서 서로 다른 문장 ID 두 개**(예: ["E03","E07"])만 골라 넣으세요.
 인용문을 직접 재작성하거나 창작하지 마세요. 두 ID의 근거 문장이 summary의 핵심 사실을 실제로 뒷받침해야 합니다.
 독립적인 사실 2개가 확인되지 않는 후보는 선택하지 마세요.
-응답 전 headline 및 summary 길이를 확인하세요. 일반 아침뉴스는 55~125자, 보험·의료 뉴스는 70~125자이며 원문에서 확인되지 않는 사실을 추가하지 마세요.
+응답 전 headline 및 summary 길이를 확인하세요. 일반 아침뉴스는 55~180자, 보험·의료 뉴스는 70~180자이며, 120~180자의 충실한 설명을 우선하고 원문에서 확인되지 않는 사실을 추가하지 마세요.
 반드시 {"items":[{"category":"...","candidate_id":"원문 후보 id","headline":"...","summary":"...","evidence_ids":["E01", "E02"]}]} JSON만 출력하세요.
 요청 카테고리: ''' + ', '.join(needed_categories)
     if len(needed_categories)==1 and len(input_payload)==1:
@@ -763,7 +763,7 @@ def _fallback_sentence_candidates(article: dict) -> list[tuple[float, str, str]]
     for index, (eid, passage) in enumerate(catalog.items()):
         sentence = compact(passage)
         identifier = normalize(sentence)
-        if identifier in seen or not (24 <= len(sentence) <= 125):
+        if identifier in seen or not (24 <= len(sentence) <= 180):
             continue
         if not sentence.endswith(('.', '!', '?', '。')) or not re.search(r'[가-힣]', sentence):
             continue
@@ -892,7 +892,7 @@ def _narrow_ai_repair(key: str, candidate: dict) -> dict | None:
     instruction=('다음 한국어 뉴스 기사에서 실제로 추출한 완결된 사실 문장 두 개만 이용해 '
        '고객에게 보여줄 요약을 작성해 주세요. 문장에 없는 일시·숫자·기관·제도·시행 여부를 만들어서는 안 됩니다. '
        '확정/제안/검토/시행을 구분하고 자극적인 해석이나 상투적인 말은 제외하세요. '
-       'headline은 18~56자, summary는 공백 포함 55~125자(보험·의료는 70~125자)이며 실제 사실 2개를 담은 자연스러운 1~2문장입니다. '
+       'headline은 18~56자, summary는 공백 포함 55~180자(보험·의료는 70~180자)이며 실제 사실 2개를 담은 자연스러운 1~2문장입니다. '
        '제목을 그대로 본문 앞에 반복하지 마세요. 단 한 건에 대해 headline과 summary 두 문자열을 반드시 반환하세요. '
        '요약에 나타나는 모든 숫자는 제공된 출처 제목 또는 아래 사실 문장에 나오는 숫자여야 합니다. 원문에서 확인되지 않는 새로운 효과나 향후 일정은 추가하지 마세요. 같은 의미를 반복해서 분량을 채우지 마세요. '
        '원문 제목: '+raw_title+'\n근거1: '+source1+'\n근거2: '+source2)
@@ -951,7 +951,7 @@ def _safe_extractive_fallback(article: dict) -> dict | None:
                 continue
             summary = _formalize_source_sentence(text_a) + ' ' + _formalize_source_sentence(text_b)
             minimum = 55 if article.get('category') in GENERAL_CATEGORIES else 70
-            if not (minimum <= len(summary) <= 125):
+            if not (minimum <= len(summary) <= 180):
                 continue
             # Conservative copyright guard: never use more than 25 whitespace
             # separated words verbatim from a single private news source.
@@ -1097,7 +1097,7 @@ def write_verified_news(candidates:dict[str,list[dict]], *, medical:bool=False) 
                 'selection_mode':'extractive_fallback',
             }
             reasons.pop(cat, None)
-            print(f'[검증된 원문 기반 대체] {cat}: 독립 근거 2개, 70~125자 요약 확인', flush=True)
+            print(f'[검증된 원문 기반 대체] {cat}: 독립 근거 2개, 70~180자 요약 확인', flush=True)
             break
         if cat not in approved:
             reasons[cat] = (reasons.get(cat, '검증 가능한 AI 기사 없음')
@@ -1195,3 +1195,4 @@ def build_news() -> tuple[list[dict],list[dict]]:
     general=write_verified_news(collect_candidates(GENERAL_CATEGORIES),medical=False)
     med=write_verified_news(collect_candidates(MEDICAL_CATEGORIES),medical=True)
     return general, med
+
