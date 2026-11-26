@@ -20,7 +20,7 @@ def stub_sender(monkeypatch, tmp_path, existing=None, event='schedule', run='101
     monkeypatch.setattr(send_kakao, 'SENT_FILE', f)
     monkeypatch.setattr(send_kakao, 'generated_card_date', lambda: DATE)
     monkeypatch.setattr(send_kakao, 'refreshed_access_token', lambda: 'placeholder-token')
-    monkeypatch.setattr(send_kakao, 'wait_page', lambda url: None)
+    monkeypatch.setattr(send_kakao, 'wait_page', lambda url, **kw: None)
     monkeypatch.setenv('PAGES_BASE_URL', 'https://example.github.io/boram-morning-cardnews/')
     monkeypatch.setenv('GITHUB_EVENT_NAME', event)
     monkeypatch.setenv('GITHUB_RUN_ID', run)
@@ -33,37 +33,29 @@ def read_day(path):
     return json.loads(path.read_text(encoding='utf-8'))[DATE]
 
 
-def test_legacy_manual_record_does_not_block_schedule(monkeypatch, tmp_path):
+def test_legacy_record_blocks_daily_resend(monkeypatch, tmp_path):
     path, calls = stub_sender(monkeypatch,tmp_path,existing=['medical','morning'])
     send_kakao.main()
-    assert len(calls) == 2
-    assert read_day(path)['legacy'] == ['medical','morning']
-    assert read_day(path)['schedule'] == ['medical','morning']
-    send_kakao.main()
-    assert len(calls) == 2  # 두 번째 예약은 차단
+    assert calls == []
+    assert read_day(path) == ['medical','morning']
 
 
-def test_manual_after_schedule_uses_independent_record(monkeypatch, tmp_path):
+def test_manual_after_schedule_remains_deduplicated(monkeypatch, tmp_path):
     path, calls = stub_sender(monkeypatch,tmp_path,existing={'schedule':['medical','morning']},event='workflow_dispatch',run='202')
     send_kakao.main()
-    assert len(calls) == 2
-    assert read_day(path)['schedule'] == ['medical','morning']
-    assert read_day(path)['manual-202'] == ['medical','morning']
-    send_kakao.main()
-    assert len(calls) == 2  # 동일 수동 실행 재시도는 중복 차단
+    assert calls == []
     monkeypatch.setenv('GITHUB_RUN_ID','203')
     send_kakao.main()
-    assert len(calls) == 4  # 새 수동 실행은 발송 가능
+    assert calls == []
 
 
-def test_manual_first_does_not_block_schedule(monkeypatch, tmp_path):
+def test_manual_first_blocks_schedule(monkeypatch, tmp_path):
     path, calls = stub_sender(monkeypatch,tmp_path,existing={},event='workflow_dispatch',run='204')
     send_kakao.main()
-    assert len(calls) == 2
     monkeypatch.setenv('GITHUB_EVENT_NAME','schedule')
     send_kakao.main()
-    assert len(calls) == 4
-    assert read_day(path)['schedule'] == ['medical','morning']
+    assert len(calls) == 2
+    assert read_day(path)['daily'] == ['medical','morning']
 
 
 def test_partial_failure_only_resends_missing_card(monkeypatch, tmp_path):
@@ -75,14 +67,36 @@ def test_partial_failure_only_resends_missing_card(monkeypatch, tmp_path):
     monkeypatch.setattr(send_kakao,'send_one',flaky)
     with pytest.raises(RuntimeError):
         send_kakao.main()
-    assert read_day(path)['schedule'] == ['morning']
+    assert read_day(path)['daily'] == ['morning']
     monkeypatch.setattr(send_kakao,'send_one',lambda token,title,image_url,original_url,date: calls.append(title))
     send_kakao.main()
     assert len(calls)==2
     assert '보험' in calls[-1]
-    assert read_day(path)['schedule'] == ['medical','morning']
+    assert read_day(path)['daily'] == ['medical','morning']
 
 
 def test_scheduled_cron_uses_early_buffer():
     wf=(ROOT/'.github/workflows/morning.yml').read_text(encoding='utf-8')
     assert "cron: '10 20 * * 0-4'" in wf
+
+
+
+def test_explicit_test_does_not_reset_regular_receipt(monkeypatch, tmp_path):
+    path, calls = stub_sender(monkeypatch,tmp_path,existing={'daily':['medical','morning']},event='workflow_dispatch',run='222')
+    send_kakao.main(test=True)
+    assert len(calls) == 2
+    assert all(title.startswith('[테스트]') for title, _, _ in calls)
+    records = json.loads(path.read_text())
+    assert records[DATE] == {'daily':['medical','morning']}
+    assert records['test-'+DATE+'-222']['daily'] == ['medical','morning']
+    send_kakao.main(test=True)
+    assert len(calls) == 2
+    send_kakao.main()
+    assert len(calls) == 2
+
+
+def test_scheduled_event_cannot_request_test(monkeypatch, tmp_path):
+    path, calls = stub_sender(monkeypatch,tmp_path,event='schedule')
+    with pytest.raises(RuntimeError, match='수동 실행'):
+        send_kakao.main(test=True)
+    assert calls == []

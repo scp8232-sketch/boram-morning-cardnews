@@ -82,3 +82,22 @@ def test_token_auth_retry_503_then_success(monkeypatch,tmp_path):
     assert send_kakao.refreshed_access_token()=='test'
     assert len(calls)==2
     assert (tmp_path/'refresh.enc').is_file()
+
+
+def test_wait_page_rejects_stale_cdn_image(monkeypatch):
+    import hashlib
+    class Response:
+        status_code = 200
+        headers = {'Content-Type': 'image/png'}
+        def __init__(self, data): self.content = data
+    images = iter([Response(b'old edition'), Response(b'approved edition')])
+    calls = []
+    def get(*args, **kwargs):
+        calls.append(1)
+        return next(images)
+    monkeypatch.setattr(send_kakao.requests, 'get', get)
+    monkeypatch.setattr(send_kakao.time, 'sleep', lambda _: None)
+    send_kakao.wait_page('https://example.org/morning.png',
+                         expected_sha=hashlib.sha256(b'approved edition').hexdigest())
+    assert len(calls) == 2
+

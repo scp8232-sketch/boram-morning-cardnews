@@ -49,7 +49,7 @@ def test_demo_render(tmp_path):
     for p in [morning, medical]:
         assert p.exists()
         im = Image.open(p)
-        assert im.size == (1536, 1980)
+        assert im.size == (1536, 2220)
         assert im.getpixel((0, 0))[3] == 0  # 둥근 외곽 네 모서리 투명
         assert p.with_name(p.stem+'-preview.jpg').exists()
 
@@ -152,3 +152,4 @@ def test_gold_icon_contains_no_stray_letter_pixels():
     assert im.size == (47,39)
     assert all(im.getpixel((x,y))[3] == 0
                for x in range(35,47) for y in range(39))
+

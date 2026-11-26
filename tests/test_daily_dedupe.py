@@ -19,7 +19,7 @@ def test_partial_old_receipt_sends_only_missing(monkeypatch,tmp_path):
     f=setup(monkeypatch,tmp_path, {'manual-111':['morning']})
     calls=[]
     monkeypatch.setattr(mod,'refreshed_access_token',lambda:'token')
-    monkeypatch.setattr(mod,'wait_page',lambda url:None)
+    monkeypatch.setattr(mod,'wait_page',lambda url, **kw:None)
     monkeypatch.setattr(mod,'send_one',lambda token,title,img,orig,date:calls.append(title))
     mod.main()
     assert calls==['보험·의료 브리핑']
@@ -32,7 +32,7 @@ def test_new_daily_receipt_blocks_next_manual_run(monkeypatch,tmp_path):
     f=setup(monkeypatch,tmp_path,{})
     calls=[]
     monkeypatch.setattr(mod,'refreshed_access_token',lambda:'token')
-    monkeypatch.setattr(mod,'wait_page',lambda url:None)
+    monkeypatch.setattr(mod,'wait_page',lambda url, **kw:None)
     monkeypatch.setattr(mod,'send_one',lambda *a:calls.append(1))
     monkeypatch.setenv('GITHUB_RUN_ID','100')
     mod.main()
@@ -40,3 +40,4 @@ def test_new_daily_receipt_blocks_next_manual_run(monkeypatch,tmp_path):
     mod.main()
     assert len(calls)==2
     assert json.loads(f.read_text())['2026-11-25']['daily']==['medical','morning']
+
